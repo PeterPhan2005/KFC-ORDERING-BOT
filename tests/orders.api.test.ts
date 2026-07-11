@@ -448,7 +448,7 @@ describe("orders API", () => {
     expect(response.headers["content-type"]).toContain("text/html");
     expect(response.text).toContain("KFC Tracks Dashboard");
     expect(response.text).toContain("Food ordering dashboard for VNPay review");
-    expect(response.text).toContain("/payments/vnpay/ipn");
+    expect(response.text).toContain("/api/v1/payment/vnpay-ipn");
     expect(response.text).toContain("Featured Menu");
   });
 

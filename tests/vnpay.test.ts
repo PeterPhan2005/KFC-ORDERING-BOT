@@ -16,8 +16,8 @@ describe("VNPay sandbox integration", () => {
     config.vnpay.tmnCode = "TESTCODE";
     config.vnpay.hashSecret = "test-hash-secret";
     config.vnpay.paymentUrl = "https://sandbox.vnpayment.vn/paymentv2/vpcpay.html";
-    config.vnpay.returnUrl = "https://example.com/payments/vnpay/return";
-    config.vnpay.ipnUrl = "https://example.com/payments/vnpay/ipn";
+    config.vnpay.returnUrl = "https://example.com/api/v1/payment/vnpay-return";
+    config.vnpay.ipnUrl = "https://example.com/api/v1/payment/vnpay-ipn";
     config.telegram.botUrl = "https://t.me/Cfc_Kfc_ordering_bot";
   });
 
@@ -27,6 +27,7 @@ describe("VNPay sandbox integration", () => {
 
     expect(paymentUrl.searchParams.get("vnp_TxnRef")).toBe(order.id);
     expect(paymentUrl.searchParams.get("vnp_Amount")).toBe(String(order.quote.total * 100));
+    expect(paymentUrl.searchParams.get("vnp_ReturnUrl")).toBe("https://example.com/api/v1/payment/vnpay-return");
     expect(verifyVnpayCallback(Object.fromEntries(paymentUrl.searchParams))).toMatchObject({
       orderId: order.id,
       isValid: true
@@ -43,7 +44,7 @@ describe("VNPay sandbox integration", () => {
     };
 
     const response = await request(app)
-      .get("/payments/vnpay/ipn")
+      .get("/api/v1/payment/vnpay-ipn")
       .query({ ...params, vnp_SecureHash: createVnpaySecureHash(params) })
       .expect(200);
 
@@ -90,7 +91,7 @@ describe("VNPay sandbox integration", () => {
     };
 
     const response = await request(app)
-      .get("/payments/vnpay/return")
+      .get("/api/v1/payment/vnpay-return")
       .query({ ...params, vnp_SecureHash: createVnpaySecureHash(params) })
       .expect(303);
 

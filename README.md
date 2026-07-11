@@ -83,10 +83,10 @@ GET /payments/vnpay/orders/:orderId
 The endpoint creates a signed sandbox payment URL. The VNPay IPN endpoint is:
 
 ```text
-GET /payments/vnpay/ipn
+GET /api/v1/payment/vnpay-ipn
 ```
 
-Set `VNPAY_TMN_CODE`, `VNPAY_HASH_SECRET`, `VNPAY_RETURN_URL`, `VNPAY_IPN_URL`, and `TELEGRAM_BOT_URL` before using it. Keep `VNPAY_RETURN_URL` on this website, for example `/payments/vnpay/return`; after the return callback is verified, the customer is redirected back to the Telegram bot. The IPN signature and order amount are verified before an order is marked `PAID`.
+Set `VNPAY_TMN_CODE`, `VNPAY_HASH_SECRET`, `VNPAY_RETURN_URL`, `VNPAY_IPN_URL`, and `TELEGRAM_BOT_URL` before using it. Keep `VNPAY_RETURN_URL` on this website, for example `/api/v1/payment/vnpay-return`; after the return callback is verified, the customer is redirected back to the Telegram bot. The IPN signature and order amount are verified before an order is marked `PAID`.
 
 ### Admin dashboard
 

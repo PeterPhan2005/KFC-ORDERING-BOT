@@ -51,8 +51,8 @@ TELEGRAM_WEBHOOK_SECRET=use-letters-numbers-underscore-or-dash
 TELEGRAM_BOT_URL=https://t.me/Cfc_Kfc_ordering_bot
 VNPAY_TMN_CODE=...
 VNPAY_HASH_SECRET=...
-VNPAY_RETURN_URL=https://bot.example.com/payments/vnpay/return
-VNPAY_IPN_URL=https://bot.example.com/payments/vnpay/ipn
+VNPAY_RETURN_URL=https://bot.example.com/api/v1/payment/vnpay-return
+VNPAY_IPN_URL=https://bot.example.com/api/v1/payment/vnpay-ipn
 TELEGRAM_E2E_CHAT_ID=your-numeric-chat-id
 ```
 

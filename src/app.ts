@@ -1,5 +1,5 @@
 import cors from "cors";
-import express, { type ErrorRequestHandler } from "express";
+import express, { type ErrorRequestHandler, type NextFunction, type Request, type Response } from "express";
 import helmet from "helmet";
 import morgan from "morgan";
 import { join } from "node:path";
@@ -243,61 +243,11 @@ export function createApp() {
     }
   });
 
-  app.get("/payments/vnpay/return", async (request, response, next) => {
-    try {
-      const result = verifyVnpayCallback(request.query);
-      const order = result.orderId ? await getOrder(result.orderId) : undefined;
-      const amountMatches = order && String(order.quote.total * 100) === String(request.query.vnp_Amount ?? "");
+  app.get("/payments/vnpay/return", handleVnpayReturn);
+  app.get("/api/v1/payment/vnpay-return", handleVnpayReturn);
 
-      if (!result.isValid || !order || !amountMatches) {
-        response.status(400).type("html").send(renderVnpayReturnError());
-        return;
-      }
-
-      if (result.isSuccessfulPayment && order.status !== "PAID") {
-        await updateOrderStatus(order.id, "PAID");
-      }
-
-      response.redirect(
-        303,
-        createTelegramPaymentReturnUrl(order.id, result.isSuccessfulPayment ? "paid" : "failed")
-      );
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  app.get("/payments/vnpay/ipn", async (request, response) => {
-    try {
-      const result = verifyVnpayCallback(request.query);
-
-      if (!result.isValid) {
-        response.json({ RspCode: "97", Message: "Invalid signature" });
-        return;
-      }
-
-      const order = await getOrder(result.orderId);
-
-      if (!order) {
-        response.json({ RspCode: "01", Message: "Order not found" });
-        return;
-      }
-
-      if (String(order.quote.total * 100) !== String(request.query.vnp_Amount ?? "")) {
-        response.json({ RspCode: "04", Message: "Invalid amount" });
-        return;
-      }
-
-      if (result.isSuccessfulPayment && order.status !== "PAID") {
-        await updateOrderStatus(order.id, "PAID");
-      }
-
-      response.json({ RspCode: "00", Message: "Confirm Success" });
-    } catch (error) {
-      console.error("VNPay IPN processing failed.", error);
-      response.json({ RspCode: "99", Message: "Unknown error" });
-    }
-  });
+  app.get("/payments/vnpay/ipn", handleVnpayIpn);
+  app.get("/api/v1/payment/vnpay-ipn", handleVnpayIpn);
 
   app.get("/orders", async (_request, response, next) => {
     try {
@@ -346,6 +296,62 @@ export function createApp() {
   app.use(errorHandler);
 
   return app;
+}
+
+async function handleVnpayReturn(request: Request, response: Response, next: NextFunction) {
+  try {
+    const result = verifyVnpayCallback(request.query);
+    const order = result.orderId ? await getOrder(result.orderId) : undefined;
+    const amountMatches = order && String(order.quote.total * 100) === String(request.query.vnp_Amount ?? "");
+
+    if (!result.isValid || !order || !amountMatches) {
+      response.status(400).type("html").send(renderVnpayReturnError());
+      return;
+    }
+
+    if (result.isSuccessfulPayment && order.status !== "PAID") {
+      await updateOrderStatus(order.id, "PAID");
+    }
+
+    response.redirect(
+      303,
+      createTelegramPaymentReturnUrl(order.id, result.isSuccessfulPayment ? "paid" : "failed")
+    );
+  } catch (error) {
+    next(error);
+  }
+}
+
+async function handleVnpayIpn(request: Request, response: Response) {
+  try {
+    const result = verifyVnpayCallback(request.query);
+
+    if (!result.isValid) {
+      response.json({ RspCode: "97", Message: "Invalid signature" });
+      return;
+    }
+
+    const order = await getOrder(result.orderId);
+
+    if (!order) {
+      response.json({ RspCode: "01", Message: "Order not found" });
+      return;
+    }
+
+    if (String(order.quote.total * 100) !== String(request.query.vnp_Amount ?? "")) {
+      response.json({ RspCode: "04", Message: "Invalid amount" });
+      return;
+    }
+
+    if (result.isSuccessfulPayment && order.status !== "PAID") {
+      await updateOrderStatus(order.id, "PAID");
+    }
+
+    response.json({ RspCode: "00", Message: "Confirm Success" });
+  } catch (error) {
+    console.error("VNPay IPN processing failed.", error);
+    response.json({ RspCode: "99", Message: "Unknown error" });
+  }
 }
 
 function createTelegramPaymentReturnUrl(orderId: string, status: "paid" | "failed"): string {

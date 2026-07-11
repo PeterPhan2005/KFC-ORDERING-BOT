@@ -31,8 +31,8 @@ export const config = {
     tmnCode: process.env.VNPAY_TMN_CODE ?? "",
     hashSecret: process.env.VNPAY_HASH_SECRET ?? "",
     paymentUrl: process.env.VNPAY_PAYMENT_URL ?? "https://sandbox.vnpayment.vn/paymentv2/vpcpay.html",
-    returnUrl: process.env.VNPAY_RETURN_URL ?? `${process.env.APP_BASE_URL ?? "http://localhost:3000"}/payments/vnpay/return`,
-    ipnUrl: process.env.VNPAY_IPN_URL ?? `${process.env.APP_BASE_URL ?? "http://localhost:3000"}/payments/vnpay/ipn`
+    returnUrl: process.env.VNPAY_RETURN_URL ?? `${process.env.APP_BASE_URL ?? "http://localhost:3000"}/api/v1/payment/vnpay-return`,
+    ipnUrl: process.env.VNPAY_IPN_URL ?? `${process.env.APP_BASE_URL ?? "http://localhost:3000"}/api/v1/payment/vnpay-ipn`
   },
   llm: {
     provider: llmProvider,
