@@ -52,7 +52,7 @@ Returns fake KFC menu items and categories.
     { "sku": "offline-thuc-uong-trang-mieng-pepsi-tieu-chuan-3", "quantity": 1 }
   ],
   "couponCode": "KFC20",
-  "deliveryAddress": "123 Nguyen Trai, District 1, HCMC"
+  "deliveryAddress": "<customer delivery address>"
 }
 ```
 
@@ -65,8 +65,8 @@ Returns fake KFC menu items and categories.
   "paymentMethod": "cod",
   "customer": {
     "name": "Peter",
-    "phone": "0900000000",
-    "address": "123 Nguyen Trai, District 1, HCMC"
+    "phone": "<customer phone>",
+    "address": "<customer delivery address>"
   },
   "notes": "It cay"
 }
@@ -127,12 +127,18 @@ POST /webhooks/telegram
 
 Supported examples:
 
+- `/vi` to switch to Vietnamese.
+- `/en` to switch to English.
+- `/language` to show language commands.
+- `/points` to check loyalty points after phone verification.
+- `/voucher` to apply the best available voucher for the current cart.
+- `/handoff` to hand the conversation to staff with cart/context summary.
 - `cho mình 2 combo burger zinger và 1 pepsi`
 - `M001-2` to order two units of menu item `M001` (also supports `M001 x 2`)
 - `coupon KFC20`
 - `thanh toán vnpay` or `COD`
 - `ghi chú ít đá`
-- `sđt 0900000000, địa chỉ 123 Nguyễn Trãi Quận 1`
+- `sđt <số điện thoại>, địa chỉ <địa chỉ giao hàng>`
 - `không có coupon` when the customer does not have a discount code
 - `xác nhận`
 
@@ -141,6 +147,30 @@ The bot keeps a per-chat in-memory draft. It shows a fresh quote, checks stock a
 Every displayed menu item has a short order ID such as `M001`. Customers can order with the ID and quantity without typing the full Vietnamese product name: `M001-2`, `M001 x 2`, or `M001 2`.
 
 For product images to work in Telegram, `APP_BASE_URL` must be a public HTTPS URL that can serve `/assets/image/*` (for local testing, use the current ngrok URL). Restart `npm run dev` after changing `.env`.
+
+#### Optional LLM routing
+
+Set an LLM API key to enable LLM-assisted routing for natural Telegram messages. OpenAI-compatible providers are supported.
+
+```bash
+LLM_PROVIDER=openai
+LLM_API_KEY=sk-...
+LLM_BASE_URL=https://api.openai.com/v1
+LLM_MODEL=gpt-4o-mini
+LLM_TIMEOUT_MS=8000
+```
+
+Qwen/DashScope example:
+
+```bash
+LLM_PROVIDER=qwen
+DASHSCOPE_API_KEY=sk-...
+QWEN_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+QWEN_MODEL=qwen-plus
+LLM_TIMEOUT_MS=8000
+```
+
+The LLM does not create orders directly. It only rewrites hard-to-parse customer messages into safe internal commands such as `/menu`, `2 combo burger zinger`, `coupon KFC20`, `COD`, or `xác nhận`. Pricing, stock checks, coupon validation, payment links, and order creation still run through the deterministic services in this app. If no LLM API key is configured or the API call fails, the bot falls back to the rule-based parser.
 
 ### Live Telegram E2E test
 

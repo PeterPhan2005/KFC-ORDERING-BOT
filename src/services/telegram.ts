@@ -30,6 +30,16 @@ export type TelegramProcessingResult = {
 
 const processedUpdateIds: number[] = [];
 const processedUpdateIdSet = new Set<number>();
+const telegramCommands = [
+  { command: "start", description: "Start the bot" },
+  { command: "menu", description: "View menu" },
+  { command: "language", description: "Show language commands" },
+  { command: "vi", description: "Switch to Vietnamese" },
+  { command: "en", description: "Switch to English" },
+  { command: "points", description: "Check loyalty points" },
+  { command: "voucher", description: "Apply best voucher" },
+  { command: "handoff", description: "Talk to staff" }
+];
 
 export function isTelegramWebhookAuthorized(secretHeader: string | undefined): boolean {
   if (!isConfiguredSecret(config.telegram.webhookSecret)) {
@@ -37,6 +47,27 @@ export function isTelegramWebhookAuthorized(secretHeader: string | undefined): b
   }
 
   return secretHeader === config.telegram.webhookSecret;
+}
+
+export async function configureTelegramBotCommands(): Promise<void> {
+  if (config.nodeEnv === "test" || !isConfiguredSecret(config.telegram.botToken)) {
+    return;
+  }
+
+  const response = await fetch(`https://api.telegram.org/bot${config.telegram.botToken}/setMyCommands`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      commands: telegramCommands
+    })
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    console.error(`Telegram setMyCommands failed with ${response.status}: ${body}`);
+  }
 }
 
 export async function processTelegramWebhook(update: TelegramUpdate): Promise<TelegramProcessingResult> {
@@ -59,7 +90,7 @@ export async function processTelegramWebhook(update: TelegramUpdate): Promise<Te
   const text = message.text?.trim().toLowerCase();
 
   if (!text) {
-    await sendTelegramMessage(message.chat.id, "Minh hien chi nhan order bang tin nhan text.");
+    await sendTelegramMessage(message.chat.id, "Hiện tại mình chỉ nhận đơn qua tin nhắn chữ. Bạn gõ /menu để xem món nhé.");
     return {
       processedEvents: 1,
       createdOrders: []
@@ -98,7 +129,10 @@ async function sendTelegramMessage(chatId: TelegramChatId, text: string): Promis
     },
     body: JSON.stringify({
       chat_id: chatId,
-      text
+      text,
+      reply_markup: {
+        remove_keyboard: true
+      }
     })
   });
 

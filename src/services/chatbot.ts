@@ -1,4 +1,5 @@
 import { config } from "../config.js";
+import { coupons } from "../data/coupons.js";
 import { AppError } from "../lib/app-error.js";
 import type { CustomerInfo, MenuItem, Order, PaymentMethod, QuoteInputItem } from "../types.js";
 import {
@@ -18,6 +19,7 @@ import {
 import { createOrder } from "./orders.js";
 import { createQuote } from "./pricing.js";
 import { getStoreHours } from "./store.js";
+import { interpretChatMessageWithLlm, isLlmConfigured } from "./llm.js";
 
 type ConversationStatus = "IDLE" | "BUILDING_ORDER" | "AWAITING_CONFIRMATION" | "CONFIRMED";
 
@@ -34,14 +36,21 @@ type DraftOrder = {
   couponHandled: boolean;
   paymentMethod?: PaymentMethod;
   notes?: string;
+  loyalty?: {
+    status: "verified";
+    phone: string;
+    points: number;
+    tier: string;
+  };
 };
 
 type ConversationSession = {
   chatId: string;
+  locale: "vi" | "en";
   status: ConversationStatus;
   draft: DraftOrder;
   lastOrderId?: string;
-  pendingQuestion?: "checkout" | "coupon" | "payment";
+  pendingQuestion?: "checkout" | "coupon" | "payment" | "loyalty";
   updatedAt: string;
 };
 
@@ -58,6 +67,10 @@ export type ChatMessageResult = {
   imageUrls: string[];
 };
 
+type ChatProcessingOptions = {
+  allowLlm?: boolean;
+};
+
 type RequestedItem = {
   item: MenuItem;
   quantity: number;
@@ -66,14 +79,32 @@ type RequestedItem = {
 
 const sessions = new Map<string, ConversationSession>();
 
-export async function processChatMessage(input: ChatMessageInput): Promise<ChatMessageResult> {
+export async function processChatMessage(input: ChatMessageInput, options: ChatProcessingOptions = {}): Promise<ChatMessageResult> {
+  const allowLlm = options.allowLlm ?? true;
   const text = input.text.trim();
   const normalizedText = normalizeSearchText(text);
   const session = getOrCreateSession(input.chatId, input.displayName);
+  const requestedLocale = getLanguageSwitchLocale(normalizedText);
+
+  if (requestedLocale) {
+    session.locale = requestedLocale;
+    session.updatedAt = new Date().toISOString();
+    return reply(formatLanguageSwitchConfirmation(requestedLocale));
+  }
+
+  session.locale = detectLocale(text, normalizedText, session.locale);
   session.updatedAt = new Date().toISOString();
 
   if (!text) {
-    return reply("I can only process text messages. Type /menu to view the menu.");
+    return reply(
+      session.locale === "vi"
+        ? "Mình chỉ nhận đơn qua tin nhắn chữ. Bạn gõ /menu để xem món nhé."
+        : "I can only process text messages. Type /menu to view the menu."
+    );
+  }
+
+  if (isLanguageHelpIntent(normalizedText)) {
+    return reply(formatLanguageHelp(session.locale));
   }
 
   const contactUpdate = extractContactInfo(text, session);
@@ -86,18 +117,51 @@ export async function processChatMessage(input: ChatMessageInput): Promise<ChatM
     session.draft.customer.address = contactUpdate.address;
   }
 
+  if (isLegacyAddressIntent(normalizedText)) {
+    return reply(formatLegacyAddressUnavailable(session));
+  }
+
+  if (session.pendingQuestion === "loyalty" && contactUpdate.phone) {
+    return reply(handleLoyaltyLookup(session, contactUpdate.phone));
+  }
+
   if (isGreeting(normalizedText)) {
     return reply(
-      [
-        "Hello! I am the KFC ordering bot.",
-        "Would you like to view the menu, get a combo suggestion, or place an order?",
-        "Example: \"2 Zinger Burger Combos\", \"M001-2\", or \"/menu\"."
-      ].join("\n")
+      session.locale === "vi"
+        ? [
+            "Chào bạn, mình đây.",
+            "Bạn muốn mình gợi ý món, xem menu hay đặt luôn vài phần KFC?",
+            "Cứ nhắn tự nhiên kiểu \"em muốn burger cay với pepsi\" hoặc gõ /menu để xem thực đơn nhé."
+          ].join("\n")
+        : [
+            "Hi, I am here.",
+            "Would you like a menu, a combo suggestion, or help placing an order?",
+            "You can type naturally, like \"I want a spicy burger with Pepsi\", or send /menu."
+          ].join("\n")
     );
   }
 
   if (isCancelDraftIntent(normalizedText)) {
     return handleCancelDraft(session);
+  }
+
+  if (isHumanHandoffIntent(normalizedText)) {
+    return reply(formatHandoffResponse(session, "Khách yêu cầu nói chuyện với nhân viên."));
+  }
+
+  if (isLoyaltyInquiryIntent(normalizedText)) {
+    const phone = contactUpdate.phone ?? session.draft.customer.phone;
+
+    if (!phone) {
+      session.pendingQuestion = "loyalty";
+      return reply(
+        session.locale === "vi"
+          ? "Mình có thể kiểm tra điểm thành viên, nhưng cần xác thực bằng số điện thoại trước. Bạn gửi số điện thoại thành viên giúp mình nhé."
+          : "I can check loyalty points, but I need your member phone number first."
+      );
+    }
+
+    return reply(handleLoyaltyLookup(session, phone));
   }
 
   if (isConfirmIntent(normalizedText)) {
@@ -109,7 +173,7 @@ export async function processChatMessage(input: ChatMessageInput): Promise<ChatM
   }
 
   if (isMenuIntent(normalizedText)) {
-    return reply(formatMenuResponse(text));
+    return reply(formatMenuResponse(text, session.locale));
   }
 
   const couponCode = extractCouponCode(text);
@@ -119,6 +183,10 @@ export async function processChatMessage(input: ChatMessageInput): Promise<ChatM
     session.draft.couponHandled = true;
     session.pendingQuestion = undefined;
     return reply(formatDraftResponse(session));
+  }
+
+  if (isVoucherOptimizerIntent(normalizedText)) {
+    return reply(handleVoucherOptimizer(session));
   }
 
   const paymentMethod = extractPaymentMethod(normalizedText);
@@ -133,17 +201,17 @@ export async function processChatMessage(input: ChatMessageInput): Promise<ChatM
     session.draft.couponCode = undefined;
     session.draft.couponHandled = true;
     session.pendingQuestion = "payment";
-    return reply(formatPaymentQuestion());
+    return reply(formatPaymentQuestion(session.locale));
   }
 
   const notes = extractOrderNotes(text);
 
   if (notes) {
     session.draft.notes = notes;
-    return reply(["I added your note to the order.", formatDraftResponse(session)].join("\n\n"));
+    return reply([session.locale === "vi" ? "Mình đã thêm ghi chú vào đơn." : "I added your note to the order.", formatDraftResponse(session)].join("\n\n"));
   }
 
-  const recommendation = getRecommendationResponse(normalizedText);
+  const recommendation = getRecommendationResponse(normalizedText, session.locale);
 
   if (recommendation) {
     return reply(recommendation);
@@ -171,7 +239,13 @@ export async function processChatMessage(input: ChatMessageInput): Promise<ChatM
   }
 
   if (isOrderRequestIntent(normalizedText) || isMenuCodeRequest(text)) {
-    return reply(formatUnresolvedItemResponse(text));
+    const llmResult = allowLlm ? await handleLlmInterpretation(input, session, text, normalizedText) : undefined;
+
+    if (llmResult) {
+      return llmResult;
+    }
+
+    return reply(formatUnresolvedItemResponse(text, session.locale));
   }
 
   if (contactUpdate.phone || contactUpdate.address) {
@@ -179,20 +253,43 @@ export async function processChatMessage(input: ChatMessageInput): Promise<ChatM
   }
 
   if (session.pendingQuestion === "checkout") {
+    const llmResult = allowLlm ? await handleLlmInterpretation(input, session, text, normalizedText) : undefined;
+
+    if (llmResult) {
+      return llmResult;
+    }
+
     return reply(
       [
-        "I could not confidently identify the checkout details in that message.",
-        `Please send the missing details: ${getMissingCheckoutFields(session.draft).join(", ")}.`,
-        "Example: \"0900000000, 123 Nguyen Trai Street, District 1, COD\"."
+        session.locale === "vi"
+          ? "Mình chưa nhận ra đủ thông tin giao hàng trong tin nhắn đó."
+          : "I could not confidently identify the checkout details in that message.",
+        session.locale === "vi"
+          ? `Bạn gửi thêm giúp mình: ${formatMissingFields(getMissingCheckoutFields(session.draft), session.locale)}.`
+          : `Please send the missing details: ${getMissingCheckoutFields(session.draft).join(", ")}.`,
+        session.locale === "vi"
+          ? "Ví dụ: \"sđt của bạn, địa chỉ giao hàng, COD\"."
+          : "Example: \"your phone number, delivery address, COD\"."
       ].join("\n")
     );
   }
 
+  const llmResult = allowLlm ? await handleLlmInterpretation(input, session, text, normalizedText) : undefined;
+
+  if (llmResult) {
+    return llmResult;
+  }
+
   return reply(
-    [
-      "I did not understand that.",
-      "Type /menu, ask for \"cheapest items\" or \"hot combos\", or order with \"add 1 Pepsi\"."
-    ].join("\n")
+    session.locale === "vi"
+      ? [
+          "Mình chưa hiểu ý bạn.",
+          "Bạn có thể gõ /menu, hỏi \"món rẻ nhất\", \"combo hot\", hoặc nhắn kiểu \"thêm 1 pepsi\"."
+        ].join("\n")
+      : [
+          "I did not understand that.",
+          "Type /menu, ask for \"cheapest items\" or \"hot combos\", or order with \"add 1 Pepsi\"."
+        ].join("\n")
   );
 }
 
@@ -200,9 +297,129 @@ export function clearConversationSessionsForTest() {
   sessions.clear();
 }
 
+function handleLoyaltyLookup(session: ConversationSession, phone: string): string {
+  const loyalty = createMockLoyaltyProfile(phone);
+  session.draft.customer.phone = phone;
+  session.draft.loyalty = loyalty;
+  session.pendingQuestion = undefined;
+
+  return session.locale === "vi"
+    ? [
+        `Mình đã xác thực thành viên qua số ${phone}.`,
+        `Hạng hiện tại: ${loyalty.tier}.`,
+        `Điểm khả dụng: ${loyalty.points.toLocaleString("vi-VN")} điểm.`,
+        loyalty.points >= 500
+          ? "Bạn có đủ điểm để đổi ưu đãi trong lần mua này nếu loyalty API thật hỗ trợ redeem."
+          : "Bạn chưa đủ nhiều điểm để đổi ưu đãi lớn, nhưng vẫn có thể dùng voucher nếu đủ điều kiện."
+      ].join("\n")
+    : [
+        `I verified the member phone ${phone}.`,
+        `Current tier: ${loyalty.tier}.`,
+        `Available points: ${loyalty.points.toLocaleString("en-US")}.`
+      ].join("\n");
+}
+
+function handleVoucherOptimizer(session: ConversationSession): string {
+  if (session.draft.items.length === 0) {
+    return session.locale === "vi"
+      ? "Bạn thêm món vào giỏ trước nhé, rồi mình sẽ chọn voucher tiết kiệm nhất dựa trên tổng đơn."
+      : "Add items to your cart first, then I can choose the best voucher for the order.";
+  }
+
+  const bestVoucher = findBestVoucher(session);
+
+  if (!bestVoucher) {
+    session.draft.couponHandled = true;
+    return session.locale === "vi"
+      ? "Mình đã kiểm tra các voucher hiện có nhưng chưa có mã nào áp dụng được cho giỏ này."
+      : "I checked the available vouchers, but none can be applied to this cart.";
+  }
+
+  session.draft.couponCode = bestVoucher.code;
+  session.draft.couponHandled = true;
+  session.pendingQuestion = undefined;
+
+  return [
+    session.locale === "vi"
+      ? `Mình đã chọn voucher ${bestVoucher.code} vì tiết kiệm tốt nhất cho giỏ hiện tại: giảm ${formatVnd(bestVoucher.discount)}.`
+      : `I selected voucher ${bestVoucher.code} because it saves the most for this cart: ${formatVnd(bestVoucher.discount)} off.`,
+    formatDraftResponse(session)
+  ].join("\n\n");
+}
+
+function formatHandoffResponse(session: ConversationSession, reason: string): string {
+  const summary = createHandoffSummary(session, reason);
+
+  return session.locale === "vi"
+    ? [
+        "Mình sẽ chuyển cuộc trò chuyện này cho nhân viên hỗ trợ.",
+        "Tóm tắt để nhân viên tiếp tục đúng bước:",
+        `- Lý do: ${summary.reason}`,
+        `- Trạng thái: ${summary.status}`,
+        `- Giỏ hàng: ${summary.cart}`,
+        `- Voucher: ${summary.coupon}`,
+        `- Loyalty: ${summary.loyalty}`,
+        `- Còn thiếu: ${summary.missingFields}`,
+        `- Gợi ý bước tiếp theo: ${summary.nextAction}`
+      ].join("\n")
+    : [
+        "I will hand this conversation to a staff member.",
+        "Context for the agent:",
+        `- Reason: ${summary.reason}`,
+        `- Status: ${summary.status}`,
+        `- Cart: ${summary.cart}`,
+        `- Voucher: ${summary.coupon}`,
+        `- Loyalty: ${summary.loyalty}`,
+        `- Missing: ${summary.missingFields}`,
+        `- Suggested next action: ${summary.nextAction}`
+      ].join("\n");
+}
+
+async function handleLlmInterpretation(
+  input: ChatMessageInput,
+  session: ConversationSession,
+  text: string,
+  normalizedText: string
+): Promise<ChatMessageResult | undefined> {
+  if (!isLlmConfigured()) {
+    return undefined;
+  }
+
+  const interpretation = await interpretChatMessageWithLlm({
+    locale: session.locale,
+    userText: text,
+    draftSummary: formatLlmDraftSummary(session),
+    menuContext: formatLlmMenuContext(normalizedText),
+    missingFields: getMissingCheckoutFields(session.draft),
+    pendingQuestion: session.pendingQuestion
+  });
+
+  if (!interpretation || interpretation.action === "none") {
+    return undefined;
+  }
+
+  if (interpretation.action === "reply") {
+    return reply(interpretation.reply);
+  }
+
+  if (normalizeSearchText(interpretation.text) === normalizedText) {
+    return undefined;
+  }
+
+  return processChatMessage(
+    {
+      ...input,
+      text: interpretation.text
+    },
+    {
+      allowLlm: false
+    }
+  );
+}
+
 function handleAddItems(session: ConversationSession, requestedItems: RequestedItem[], now: Date): ChatMessageResult {
   if (!isStoreOpen(now)) {
-    return reply(formatClosedStoreMessage(now));
+    return reply(formatClosedStoreMessage(now, session.locale));
   }
 
   if (session.status === "CONFIRMED") {
@@ -239,7 +456,7 @@ function handleAddItems(session: ConversationSession, requestedItems: RequestedI
       });
     }
 
-    lines.push(`Added ${requestedItem.quantity} x ${requestedItem.item.name}.`);
+    lines.push(formatAddedLine(requestedItem.item, requestedItem.quantity, session.locale));
   }
 
   return reply([...lines, formatDraftResponse(session)].join("\n\n"));
@@ -247,13 +464,17 @@ function handleAddItems(session: ConversationSession, requestedItems: RequestedI
 
 function handleRemoveItems(session: ConversationSession, text: string): ChatMessageResult {
   if (session.draft.items.length === 0) {
-    return reply("Your cart is empty.");
+    return reply(formatEmptyCart(session.locale));
   }
 
   const requestedItems = extractRequestedItems(text, session);
 
   if (requestedItems.length === 0) {
-    return reply("Which item would you like to remove? For example: \"remove Pepsi\" or \"remove Zinger Burger\".");
+    return reply(
+      session.locale === "vi"
+        ? "Bạn muốn bỏ món nào? Ví dụ: \"bỏ Pepsi\" hoặc \"bỏ combo burger zinger\"."
+        : "Which item would you like to remove? For example: \"remove Pepsi\" or \"remove Zinger Burger\"."
+    );
   }
 
   const removedLines: string[] = [];
@@ -262,7 +483,11 @@ function handleRemoveItems(session: ConversationSession, text: string): ChatMess
     const existingIndex = session.draft.items.findIndex((item) => item.sku === requestedItem.item.sku);
 
     if (existingIndex === -1) {
-      removedLines.push(`${requestedItem.item.name} is not in your cart.`);
+      removedLines.push(
+        session.locale === "vi"
+          ? `${requestedItem.item.name} không có trong giỏ hiện tại.`
+          : `${requestedItem.item.name} is not in your cart.`
+      );
       continue;
     }
 
@@ -270,10 +495,10 @@ function handleRemoveItems(session: ConversationSession, text: string): ChatMess
 
     if (requestedItem.isQuantityExplicit && requestedItem.quantity < existingItem.quantity) {
       existingItem.quantity -= requestedItem.quantity;
-      removedLines.push(`Removed ${requestedItem.quantity} x ${requestedItem.item.name}.`);
+      removedLines.push(formatRemovedLine(requestedItem.item, requestedItem.quantity, session.locale));
     } else {
       session.draft.items.splice(existingIndex, 1);
-      removedLines.push(`Removed ${requestedItem.item.name}.`);
+      removedLines.push(formatRemovedLine(requestedItem.item, undefined, session.locale));
     }
   }
 
@@ -283,7 +508,7 @@ function handleRemoveItems(session: ConversationSession, text: string): ChatMess
 
 function handleChangeItems(session: ConversationSession, text: string): ChatMessageResult {
   if (session.draft.items.length === 0) {
-    return reply("Your cart is empty. What would you like to order?");
+    return reply(session.locale === "vi" ? "Giỏ hàng đang trống. Bạn muốn đặt món nào?" : "Your cart is empty. What would you like to order?");
   }
 
   const changeParts = text.split(/\s+(?:thành|thanh|sang|to|with)\s+/i);
@@ -294,13 +519,13 @@ function handleChangeItems(session: ConversationSession, text: string): ChatMess
     const oldItem = oldItems[0];
 
     if (!oldItem) {
-      return reply("I could not identify the item you want to change.");
+      return reply(session.locale === "vi" ? "Mình chưa nhận ra món bạn muốn đổi." : "I could not identify the item you want to change.");
     }
 
     const existingItem = session.draft.items.find((item) => item.sku === oldItem.item.sku);
 
     if (!existingItem) {
-      return reply(`${oldItem.item.name} is not in your cart.`);
+      return reply(session.locale === "vi" ? `${oldItem.item.name} không có trong giỏ hiện tại.` : `${oldItem.item.name} is not in your cart.`);
     }
 
     if (newItems.length > 0) {
@@ -322,7 +547,7 @@ function handleChangeItems(session: ConversationSession, text: string): ChatMess
         session.draft.items.push({ sku: newItem.item.sku, quantity: newItem.quantity });
       }
       session.status = "BUILDING_ORDER";
-      return reply([`Changed ${oldItem.item.name} to ${newItem.item.name}.`, formatDraftResponse(session)].join("\n\n"));
+      return reply([formatChangedItemLine(oldItem.item, newItem.item, session.locale), formatDraftResponse(session)].join("\n\n"));
     }
 
     const quantity = extractQuantity(changeParts[1]);
@@ -334,7 +559,7 @@ function handleChangeItems(session: ConversationSession, text: string): ChatMess
 
     existingItem.quantity = quantity;
     session.status = "BUILDING_ORDER";
-    return reply([`Changed the quantity of ${oldItem.item.name} to ${quantity}.`, formatDraftResponse(session)].join("\n\n"));
+    return reply([formatChangedQuantityLine(oldItem.item, quantity, session.locale), formatDraftResponse(session)].join("\n\n"));
   }
 
   const requestedItems = extractRequestedItems(text, session);
@@ -362,36 +587,52 @@ function handleChangeItems(session: ConversationSession, text: string): ChatMess
     existingItem.quantity = requestedItem.quantity;
     session.status = "BUILDING_ORDER";
 
-    return reply([`Changed the quantity of ${requestedItem.item.name} to ${requestedItem.quantity}.`, formatDraftResponse(session)].join("\n\n"));
+    return reply([formatChangedQuantityLine(requestedItem.item, requestedItem.quantity, session.locale), formatDraftResponse(session)].join("\n\n"));
   }
 
-  return reply("Which item would you like to change? For example: \"change Pepsi to 2\" or \"replace Pepsi with 7Up\".");
+  return reply(
+    session.locale === "vi"
+      ? "Bạn muốn đổi món nào? Ví dụ: \"sửa Pepsi thành 2\" hoặc \"đổi Pepsi thành 7Up\"."
+      : "Which item would you like to change? For example: \"change Pepsi to 2\" or \"replace Pepsi with 7Up\"."
+  );
 }
 
 function handleCancelDraft(session: ConversationSession): ChatMessageResult {
   if (session.status === "CONFIRMED" && session.lastOrderId) {
-    return reply(`Order ${session.lastOrderId} is confirmed and can no longer be cancelled in this bot.`);
+    return reply(
+      session.locale === "vi"
+        ? `Đơn ${session.lastOrderId} đã được xác nhận nên mình không thể hủy trực tiếp trong bot.`
+        : `Order ${session.lastOrderId} is confirmed and can no longer be cancelled in this bot.`
+    );
   }
 
   if (session.draft.items.length === 0) {
-    return reply("You do not have a draft order to cancel.");
+    return reply(session.locale === "vi" ? "Bạn chưa có đơn nháp để hủy." : "You do not have a draft order to cancel.");
   }
 
   resetDraft(session);
-  return reply("Your current draft order has been cancelled. Type /menu to start a new order.");
+  return reply(
+    session.locale === "vi"
+      ? "Mình đã hủy đơn nháp hiện tại. Bạn gõ /menu để bắt đầu đơn mới nhé."
+      : "Your current draft order has been cancelled. Type /menu to start a new order."
+  );
 }
 
 async function handleConfirmOrder(session: ConversationSession, now: Date): Promise<ChatMessageResult> {
   if (session.status === "CONFIRMED" && session.lastOrderId) {
-    return reply(`Order ${session.lastOrderId} is confirmed. I cannot change or cancel it in this bot.`);
+    return reply(
+      session.locale === "vi"
+        ? `Đơn ${session.lastOrderId} đã được xác nhận. Mình không thể sửa hoặc hủy đơn này trong bot.`
+        : `Order ${session.lastOrderId} is confirmed. I cannot change or cancel it in this bot.`
+    );
   }
 
   if (session.draft.items.length === 0) {
-    return reply("Your cart is empty. What would you like to order?");
+    return reply(session.locale === "vi" ? "Giỏ hàng đang trống. Bạn muốn đặt món nào?" : "Your cart is empty. What would you like to order?");
   }
 
   if (!isStoreOpen(now)) {
-    return reply(formatClosedStoreMessage(now));
+    return reply(formatClosedStoreMessage(now, session.locale));
   }
 
   const missingFields = getMissingCheckoutFields(session.draft);
@@ -400,9 +641,11 @@ async function handleConfirmOrder(session: ConversationSession, now: Date): Prom
     session.pendingQuestion = "checkout";
     return reply(
       [
-        "I need more information before I can confirm the order.",
-        `Missing: ${missingFields.join(", ")}.`,
-        "You can send all three details in one message, for example: \"0900000000, 123 Nguyen Trai Street, COD\"; or send them across multiple messages."
+        session.locale === "vi" ? "Mình cần thêm thông tin trước khi chốt đơn." : "I need more information before I can confirm the order.",
+        session.locale === "vi" ? `Còn thiếu: ${formatMissingFields(missingFields, session.locale)}.` : `Missing: ${missingFields.join(", ")}.`,
+        session.locale === "vi"
+          ? "Bạn có thể gửi một lần theo mẫu: \"sđt của bạn, địa chỉ giao hàng, COD\", hoặc gửi từng thông tin cũng được."
+          : "You can send all three details in one message, for example: \"your phone number, delivery address, COD\"; or send them across multiple messages."
       ].join("\n")
     );
   }
@@ -410,17 +653,23 @@ async function handleConfirmOrder(session: ConversationSession, now: Date): Prom
   if (!session.draft.couponHandled) {
     session.pendingQuestion = "coupon";
     return reply(
-      [
-        "Do you have a coupon code?",
-        "If you do, send it like this: \"coupon KFC20\".",
-        "If you do not have one, reply \"no\"."
-      ].join("\n")
+      session.locale === "vi"
+        ? [
+            "Bạn có mã giảm giá không?",
+            "Nếu có, gửi theo mẫu: \"coupon KFC20\".",
+            "Nếu không có, bạn trả lời \"không\" nhé."
+          ].join("\n")
+        : [
+            "Do you have a coupon code?",
+            "If you do, send it like this: \"coupon KFC20\".",
+            "If you do not have one, reply \"no\"."
+          ].join("\n")
     );
   }
 
   if (!session.draft.paymentMethod) {
     session.pendingQuestion = "payment";
-    return reply(formatPaymentQuestion());
+    return reply(formatPaymentQuestion(session.locale));
   }
 
   try {
@@ -438,18 +687,18 @@ async function handleConfirmOrder(session: ConversationSession, now: Date): Prom
     session.draft.items = [];
 
     return {
-      reply: formatConfirmedOrder(order),
+      reply: formatConfirmedOrder(order, session.locale),
       createdOrderIds: [order.id],
       imageUrls: []
     };
   } catch (error) {
-    return reply(formatOrderError(error));
+    return reply(formatOrderError(error, session.locale));
   }
 }
 
 function formatDraftResponse(session: ConversationSession): string {
   if (session.draft.items.length === 0) {
-    return "Your cart is empty.";
+    return formatEmptyCart(session.locale);
   }
 
   try {
@@ -469,30 +718,43 @@ function formatDraftResponse(session: ConversationSession): string {
     }
 
     return [
-      "Your draft order:",
+      session.locale === "vi" ? "Đơn nháp của bạn:" : "Your draft order:",
       ...quote.items.map((item) => `- ${item.quantity} x ${item.name}: ${formatVnd(item.lineTotal)}`),
-      `Subtotal: ${formatVnd(quote.subtotal)}`,
+      `${session.locale === "vi" ? "Tạm tính" : "Subtotal"}: ${formatVnd(quote.subtotal)}`,
       quote.coupon
         ? quote.coupon.isApplied
-          ? `Coupon ${quote.coupon.code}: saved ${formatVnd(quote.coupon.discount)}.`
-          : `Coupon ${quote.coupon.code} was not applied: ${quote.coupon.reason}`
+          ? session.locale === "vi"
+            ? `Mã ${quote.coupon.code}: giảm ${formatVnd(quote.coupon.discount)}.`
+            : `Coupon ${quote.coupon.code}: saved ${formatVnd(quote.coupon.discount)}.`
+          : session.locale === "vi"
+            ? `Mã ${quote.coupon.code} chưa áp dụng được: ${formatCouponReason(quote.coupon.reason, session.locale)}`
+            : `Coupon ${quote.coupon.code} was not applied: ${quote.coupon.reason}`
         : undefined,
-      `Delivery fee: ${formatVnd(quote.deliveryFee)}`,
-      `Estimated total: ${formatVnd(quote.total)}`,
-      `Payment: ${session.draft.paymentMethod ? formatPaymentMethod(session.draft.paymentMethod) : "Not selected (COD/VNPay)"}.`,
-      session.draft.customer.phone ? `Phone: ${session.draft.customer.phone}.` : undefined,
-      session.draft.customer.address ? `Delivery address: ${session.draft.customer.address}.` : undefined,
-      session.draft.notes ? `Note: ${session.draft.notes}.` : undefined,
+      `${session.locale === "vi" ? "Phí giao hàng" : "Delivery fee"}: ${formatVnd(quote.deliveryFee)}`,
+      `${session.locale === "vi" ? "Tổng dự kiến" : "Estimated total"}: ${formatVnd(quote.total)}`,
+      `${session.locale === "vi" ? "Thanh toán" : "Payment"}: ${session.draft.paymentMethod ? formatPaymentMethod(session.draft.paymentMethod) : session.locale === "vi" ? "Chưa chọn (COD/VNPay)" : "Not selected (COD/VNPay)"}.`,
+      session.draft.customer.phone ? `${session.locale === "vi" ? "Số điện thoại" : "Phone"}: ${session.draft.customer.phone}.` : undefined,
+      session.draft.customer.address ? `${session.locale === "vi" ? "Địa chỉ giao hàng" : "Delivery address"}: ${session.draft.customer.address}.` : undefined,
+      session.draft.loyalty
+        ? session.locale === "vi"
+          ? `Thành viên: ${session.draft.loyalty.tier}, ${session.draft.loyalty.points.toLocaleString("vi-VN")} điểm.`
+          : `Member: ${session.draft.loyalty.tier}, ${session.draft.loyalty.points.toLocaleString("en-US")} points.`
+        : undefined,
+      session.draft.notes ? `${session.locale === "vi" ? "Ghi chú" : "Note"}: ${session.draft.notes}.` : undefined,
       missingFields.length > 0
-        ? `Still needed: ${missingFields.join(", ")}.`
-        : "If everything is correct, reply \"confirm\". Confirmed orders cannot be cancelled in this bot."
+        ? session.locale === "vi"
+          ? `Bạn gửi thêm giúp mình: ${formatMissingFields(missingFields, session.locale)}.`
+          : `Still needed: ${missingFields.join(", ")}.`
+        : session.locale === "vi"
+          ? "Nếu thông tin đúng, bạn nhắn \"xác nhận\" để chốt đơn. Đơn đã chốt sẽ không hủy trực tiếp trong bot được."
+          : "If everything is correct, reply \"confirm\". Confirmed orders cannot be cancelled in this bot."
     ].filter(Boolean).join("\n");
   } catch (error) {
-    return formatOrderError(error);
+    return formatOrderError(error, session.locale);
   }
 }
 
-function formatMenuResponse(text: string): string {
+function formatMenuResponse(text: string, locale: ConversationSession["locale"]): string {
   const normalizedText = normalizeSearchText(text);
   const searchQuery = normalizedText.replace(/\b(menu|thuc don|xem|co gi|mon|show|view|what|items)\b/g, "").trim();
 
@@ -500,7 +762,11 @@ function formatMenuResponse(text: string): string {
     const matches = searchMenuItems(searchQuery, 8);
 
     if (matches.length > 0) {
-      return ["I found these items:", ...matches.map(formatMenuLine), "Which item would you like to add?"].join("\n");
+      return [
+        locale === "vi" ? "Mình tìm thấy các món này:" : "I found these items:",
+        ...matches.map(formatMenuLine),
+        locale === "vi" ? "Bạn muốn thêm món nào vào giỏ?" : "Which item would you like to add?"
+      ].join("\n");
     }
   }
 
@@ -508,24 +774,34 @@ function formatMenuResponse(text: string): string {
   const featuredItems = listHotCombos(5);
 
   return [
-    "KFC menu categories:",
+    locale === "vi" ? "Các nhóm món KFC:" : "KFC menu categories:",
     ...categories.map((category) => `- ${category}`),
     "",
-    "Featured items:",
+    locale === "vi" ? "Món đang nổi bật:" : "Featured items:",
     ...featuredItems.map(formatMenuLine),
-    "Ask for \"cheapest items\" or \"hot combos\", or order with \"2 Zinger Burger Combos\"."
+    locale === "vi"
+      ? "Bạn có thể hỏi \"món rẻ nhất\", \"combo hot\", hoặc đặt luôn bằng \"2 combo burger zinger\"."
+      : "Ask for \"cheapest items\" or \"hot combos\", or order with \"2 Zinger Burger Combos\"."
   ].join("\n");
 }
 
-function getRecommendationResponse(normalizedText: string): string | undefined {
+function getRecommendationResponse(normalizedText: string, locale: ConversationSession["locale"]): string | undefined {
+  const budgetRecommendation = getBudgetRecommendationResponse(normalizedText, locale);
+
+  if (budgetRecommendation) {
+    return budgetRecommendation;
+  }
+
   if (containsAny(normalizedText, ["het mon", "mon nao het", "sold out", "unavailable", "out of stock"])) {
     const unavailableItems = listUnavailableItems(8);
 
     if (unavailableItems.length === 0) {
-      return "No items are currently unavailable. Would you like to view the menu or place an order?";
+      return locale === "vi"
+        ? "Hiện chưa có món nào hết hàng. Bạn muốn xem menu hay đặt món luôn?"
+        : "No items are currently unavailable. Would you like to view the menu or place an order?";
     }
 
-    return ["Unavailable items:", ...unavailableItems.map(formatMenuLine)].join("\n");
+    return [locale === "vi" ? "Các món hiện không khả dụng:" : "Unavailable items:", ...unavailableItems.map(formatMenuLine)].join("\n");
   }
 
   if (containsAny(normalizedText, ["spicy", "hot food", "something hot", "something spicy", "smth spicy", "cay", "do cay"])) {
@@ -534,7 +810,11 @@ function getRecommendationResponse(normalizedText: string): string | undefined {
       .filter((item) => /pepper lime|garlic fish sauce|zinger|chicken yo/i.test(item.name))
       .slice(0, 6);
 
-    return ["Spicy recommendations:", ...spicyItems.map(formatMenuLine), "Tell me an item ID and quantity to add it."].join("\n");
+    return [
+      locale === "vi" ? "Một vài món cay hợp ý bạn:" : "Spicy recommendations:",
+      ...spicyItems.map(formatMenuLine),
+      locale === "vi" ? "Bạn gửi mã món và số lượng để mình thêm vào giỏ nhé." : "Tell me an item ID and quantity to add it."
+    ].join("\n");
   }
 
   if (containsAny(normalizedText, [
@@ -550,27 +830,35 @@ function getRecommendationResponse(normalizedText: string): string | undefined {
     "low price",
     "budget"
   ])) {
-    return ["Current cheapest items:", ...listCheapestItems(6).map(formatMenuLine)].join("\n");
+    return [locale === "vi" ? "Các món giá mềm hiện có:" : "Current cheapest items:", ...listCheapestItems(6).map(formatMenuLine)].join("\n");
   }
 
   if (containsAny(normalizedText, ["which price", "better price", "best value", "value for money", "best deal"])) {
     return [
-      "For the best value, these current deals are worth considering:",
+      locale === "vi" ? "Nếu muốn tối ưu giá, bạn có thể cân nhắc các món này:" : "For the best value, these current deals are worth considering:",
       ...listHotCombos(6).map(formatMenuLine),
-      "You can also ask for \"lowest price items\" to see the cheapest options."
+      locale === "vi" ? "Bạn cũng có thể hỏi \"món rẻ nhất\" để xem lựa chọn thấp giá hơn." : "You can also ask for \"lowest price items\" to see the cheapest options."
     ].join("\n");
   }
 
   if (containsAny(normalizedText, ["5 10", "5 den 10", "nhom", "nhieu nguoi", "10 nguoi", "combo nhom", "group combo", "for a group", "large group"])) {
-    return ["Group combos for larger parties:", ...listGroupCombos(5).map(formatMenuLine)].join("\n");
+    return [locale === "vi" ? "Combo nhóm phù hợp đi nhiều người:" : "Group combos for larger parties:", ...listGroupCombos(5).map(formatMenuLine)].join("\n");
   }
 
   if (containsAny(normalizedText, ["combo hot", "hot", "uu dai", "deal", "goi y", "recommend", "suggestion"])) {
-    return ["Recommended combos and deals:", ...listHotCombos(6).map(formatMenuLine)].join("\n");
+    return [locale === "vi" ? "Combo và ưu đãi mình gợi ý:" : "Recommended combos and deals:", ...listHotCombos(6).map(formatMenuLine)].join("\n");
+  }
+
+  if (containsAny(normalizedText, ["chon giup", "chon cho", "lua giup", "an gi", "nen an", "goi y giup", "pick for me", "choose for me"])) {
+    return [
+      locale === "vi" ? "Mình gợi ý vài lựa chọn dễ ăn:" : "Here are a few easy picks:",
+      ...listHotCombos(4).map(formatMenuLine),
+      locale === "vi" ? "Bạn nhắn mã món và số lượng, ví dụ M010-1, để mình thêm vào giỏ nhé." : "Send the item ID and quantity, for example M010-1, to add it."
+    ].join("\n");
   }
 
   if (containsAny(normalizedText, ["gio mo cua", "may gio", "dong cua", "mo cua"])) {
-    return `The store accepts orders daily from ${formatStoreHours()}.`;
+    return locale === "vi" ? `Cửa hàng nhận đơn mỗi ngày từ ${formatStoreHours()}.` : `The store accepts orders daily from ${formatStoreHours()}.`;
   }
 
   return undefined;
@@ -615,11 +903,11 @@ function formatUnresolvedSegments(text: string, session: ConversationSession): s
       const suggestions = suggestMenuItemsForText(query, 4);
 
       if (suggestions.length === 0) {
-        return `I could not find "${query}" in the menu.`;
+        return session.locale === "vi" ? `Mình chưa tìm thấy "${query}" trong menu.` : `I could not find "${query}" in the menu.`;
       }
 
       return [
-        `I could not identify "${query}" exactly. Which one did you mean?`,
+        session.locale === "vi" ? `Mình chưa chắc "${query}" là món nào. Bạn muốn chọn món nào dưới đây?` : `I could not identify "${query}" exactly. Which one did you mean?`,
         ...suggestions.map(formatMenuLine)
       ].join("\n");
     })
@@ -657,11 +945,11 @@ function handleImageRequest(session: ConversationSession, text: string): ChatMes
 
   if (requestedItems.length === 1) {
     const item = requestedItems[0].item;
-    return reply(`Here is an image of ${item.name}.`, [item.imageUrl]);
+    return reply(session.locale === "vi" ? `Đây là hình của ${item.name}.` : `Here is an image of ${item.name}.`, [item.imageUrl]);
   }
 
-  return reply(formatUnresolvedItemResponse(text));
-}
+    return reply(formatUnresolvedItemResponse(text, session.locale));
+  }
 
 function cleanItemQuery(text: string): string {
   return normalizeSearchText(text)
@@ -676,19 +964,27 @@ function extractOrderId(text: string): string | undefined {
   return match ? `M${match[1]}` : undefined;
 }
 
-function formatUnresolvedItemResponse(text: string): string {
+function formatUnresolvedItemResponse(text: string, locale: ConversationSession["locale"] = "en"): string {
   const query = cleanItemQuery(text);
   const suggestions = query ? suggestMenuItemsForText(query, 3) : [];
 
   if (suggestions.length > 0) {
-    return [
-      `I could not identify \"${query}\" exactly.`,
-      "Did you mean one of these items?",
-      ...suggestions.map(formatMenuLine)
-    ].join("\n");
+    return locale === "vi"
+      ? [
+          `Mình chưa chắc "${query}" là món nào.`,
+          "Bạn muốn chọn một trong các món này không?",
+          ...suggestions.map(formatMenuLine)
+        ].join("\n")
+      : [
+          `I could not identify \"${query}\" exactly.`,
+          "Did you mean one of these items?",
+          ...suggestions.map(formatMenuLine)
+        ].join("\n");
   }
 
-  return `I could not find \"${query || text.trim()}\" in the current menu. Type /menu to view available items.`;
+  return locale === "vi"
+    ? `Mình chưa tìm thấy "${query || text.trim()}" trong menu hiện tại. Bạn gõ /menu để xem món đang bán nhé.`
+    : `I could not find \"${query || text.trim()}\" in the current menu. Type /menu to view available items.`;
 }
 
 function splitItemSegments(text: string): string[] {
@@ -859,6 +1155,56 @@ function isShowCartIntent(normalizedText: string): boolean {
   ]);
 }
 
+function isLoyaltyInquiryIntent(normalizedText: string): boolean {
+  return containsAny(normalizedText, [
+    "diem thanh vien",
+    "diem tich luy",
+    "diem loyalty",
+    "loyalty point",
+    "loyalty points",
+    "member point",
+    "member points",
+    "points",
+    "bao nhieu diem",
+    "hang thanh vien"
+  ]);
+}
+
+function isVoucherOptimizerIntent(normalizedText: string): boolean {
+  return containsAny(normalizedText, [
+    "ma nao giam nhieu nhat",
+    "voucher nao tot nhat",
+    "ma tot nhat",
+    "chon ma",
+    "tu ap ma",
+    "ap ma tot nhat",
+    "dung ma nao",
+    "best voucher",
+    "best coupon",
+    "auto voucher",
+    "voucher",
+    "apply best"
+  ]);
+}
+
+function isHumanHandoffIntent(normalizedText: string): boolean {
+  return containsAny(normalizedText, [
+    "gap nhan vien",
+    "noi chuyen voi nhan vien",
+    "nguoi that",
+    "tu van vien",
+    "call center",
+    "staff",
+    "human",
+    "agent",
+    "handoff"
+  ]);
+}
+
+function isLegacyAddressIntent(normalizedText: string): boolean {
+  return containsAny(normalizedText, ["dia chi cu", "giao nhu cu", "giao ve nha cu", "old address", "saved address"]);
+}
+
 function isRemoveIntent(normalizedText: string): boolean {
   return /(?:^|\s)bo\s+/.test(normalizedText) || containsAny(normalizedText, ["xoa mon", "huy mon", "khong lay", "remove"]);
 }
@@ -899,6 +1245,57 @@ function containsAny(value: string, patterns: string[]): boolean {
   return patterns.some((pattern) => value.includes(pattern));
 }
 
+function extractBudgetVnd(normalizedText: string): number | undefined {
+  const underMatch = normalizedText.match(/\b(?:duoi|tam|khoang|around|under|below)?\s*([1-9][0-9]{1,3})\s*(?:k|nghin|ngan)\b/);
+
+  if (underMatch) {
+    return Number(underMatch[1]) * 1000;
+  }
+
+  const vndMatch = normalizedText.match(/\b([1-9][0-9]{4,7})\s*(?:vnd|dong)?\b/);
+
+  if (vndMatch) {
+    return Number(vndMatch[1]);
+  }
+
+  return undefined;
+}
+
+function extractDiners(normalizedText: string): number | undefined {
+  const digitMatch = normalizedText.match(/\b([2-9]|10)\s*(?:nguoi|ng|pax|people)\b/);
+
+  if (digitMatch) {
+    return Number(digitMatch[1]);
+  }
+
+  const wordMatches = new Map([
+    ["hai nguoi", 2],
+    ["ba nguoi", 3],
+    ["bon nguoi", 4],
+    ["nam nguoi", 5]
+  ]);
+
+  for (const [phrase, diners] of wordMatches) {
+    if (normalizedText.includes(phrase)) {
+      return diners;
+    }
+  }
+
+  return undefined;
+}
+
+function formatLegacyAddressUnavailable(session: ConversationSession): string {
+  return session.locale === "vi"
+    ? [
+        "Mình chưa có address book đã xác thực cho cuộc trò chuyện này, nên không tự dùng \"địa chỉ cũ\" được.",
+        "Bạn gửi lại địa chỉ giao hàng giúp mình nhé."
+      ].join("\n")
+    : [
+        "I do not have a verified saved address for this conversation, so I cannot use an old address automatically.",
+        "Please send the delivery address again."
+      ].join("\n");
+}
+
 function isStoreOpen(now: Date): boolean {
   const hour = getStoreHour(now);
   const storeHours = getStoreHours();
@@ -925,12 +1322,14 @@ function formatStoreHours(): string {
   return `${String(storeHours.openHour).padStart(2, "0")}:00-${String(storeHours.closeHour).padStart(2, "0")}:00`;
 }
 
-function formatClosedStoreMessage(now: Date): string {
+function formatClosedStoreMessage(now: Date, locale: ConversationSession["locale"] = "en"): string {
   const storeHours = getStoreHours();
   const currentHour = getStoreHour(now);
   const nextOpening = currentHour >= storeHours.closeHour ? "tomorrow" : "today";
 
-  return `The store is currently closed. Please order again ${nextOpening} at ${String(storeHours.openHour).padStart(2, "0")}:00. Opening hours: ${formatStoreHours()}.`;
+  return locale === "vi"
+    ? `Hiện cửa hàng đang đóng. Bạn đặt lại ${nextOpening === "tomorrow" ? "vào ngày mai" : "hôm nay"} lúc ${String(storeHours.openHour).padStart(2, "0")}:00 nhé. Giờ mở cửa: ${formatStoreHours()}.`
+    : `The store is currently closed. Please order again ${nextOpening} at ${String(storeHours.openHour).padStart(2, "0")}:00. Opening hours: ${formatStoreHours()}.`;
 }
 
 function formatMenuLine(item: MenuItem): string {
@@ -940,8 +1339,23 @@ function formatMenuLine(item: MenuItem): string {
   return `- [${item.orderId}] ${item.name}: ${formatVnd(item.price)}${discountText}${stockText}`;
 }
 
-function formatConfirmedOrder(order: Order): string {
+function formatConfirmedOrder(order: Order, locale: ConversationSession["locale"] = "en"): string {
   const paymentLink = `${config.appBaseUrl.replace(/\/$/, "")}/payments/vnpay/orders/${order.id}`;
+
+  if (locale === "vi") {
+    return [
+      order.status === "PENDING_PAYMENT" ? "Đơn của bạn đang chờ thanh toán VNPay." : "Mình đã xác nhận đơn của bạn.",
+      `Mã đơn: ${order.id}`,
+      ...order.quote.items.map((item) => `- ${item.quantity} x ${item.name}`),
+      `Tổng cộng: ${formatVnd(order.quote.total)}`,
+      `Thanh toán: ${formatPaymentMethod(order.paymentMethod)}.`,
+      `Số điện thoại: ${order.customer.phone}.`,
+      `Địa chỉ giao hàng: ${order.customer.address}.`,
+      order.status === "PENDING_PAYMENT"
+        ? `Bạn thanh toán VNPay tại đây: ${paymentLink}`
+        : "Đơn đã xác nhận nên không hủy trực tiếp trong bot được."
+    ].join("\n");
+  }
 
   return [
     order.status === "PENDING_PAYMENT" ? "Your order is awaiting VNPay payment." : "Your order has been confirmed.",
@@ -957,12 +1371,12 @@ function formatConfirmedOrder(order: Order): string {
   ].join("\n");
 }
 
-function formatOrderError(error: unknown): string {
+function formatOrderError(error: unknown, locale: ConversationSession["locale"] = "en"): string {
   if (error instanceof AppError) {
-    return `I could not process the order: ${error.message}`;
+    return locale === "vi" ? `Mình chưa xử lý được đơn: ${formatErrorMessage(error.message, locale)}` : `I could not process the order: ${error.message}`;
   }
 
-  return "I cannot process the order right now. Please try again.";
+  return locale === "vi" ? "Hiện mình chưa xử lý được đơn. Bạn thử lại giúp mình nhé." : "I cannot process the order right now. Please try again.";
 }
 
 function formatVnd(amount: number): string {
@@ -971,6 +1385,348 @@ function formatVnd(amount: number): string {
     currency: "VND",
     maximumFractionDigits: 0
   }).format(amount);
+}
+
+function findBestVoucher(session: ConversationSession): { code: string; discount: number; total: number } | undefined {
+  const candidates = coupons
+    .map((coupon) => {
+      try {
+        const quote = createQuote({
+          items: session.draft.items,
+          couponCode: coupon.code,
+          paymentMethod: session.draft.paymentMethod,
+          deliveryAddress: session.draft.customer.address
+        });
+
+        if (!quote.coupon?.isApplied || quote.coupon.discount <= 0) {
+          return undefined;
+        }
+
+        return {
+          code: coupon.code,
+          discount: quote.coupon.discount,
+          total: quote.total
+        };
+      } catch {
+        return undefined;
+      }
+    })
+    .filter((candidate): candidate is { code: string; discount: number; total: number } => Boolean(candidate));
+
+  return candidates.sort((left, right) => right.discount - left.discount || left.total - right.total)[0];
+}
+
+function createMockLoyaltyProfile(phone: string): { status: "verified"; phone: string; points: number; tier: string } {
+  const digits = phone.replace(/\D/g, "");
+  const seed = Number(digits.slice(-4) || "0");
+  const points = 120 + (seed % 1800);
+  const tier = points >= 1200 ? "Gold" : points >= 600 ? "Silver" : "Member";
+
+  return {
+    status: "verified",
+    phone,
+    points,
+    tier
+  };
+}
+
+function createHandoffSummary(session: ConversationSession, reason: string) {
+  const missingFields = getMissingCheckoutFields(session.draft);
+  const cart = session.draft.items
+    .map((draftItem) => {
+      const item = getMenuItem(draftItem.sku);
+      return item ? `${draftItem.quantity} x ${item.name}` : `${draftItem.quantity} x ${draftItem.sku}`;
+    })
+    .join("; ");
+
+  return {
+    reason,
+    status: session.status,
+    cart: cart || "empty",
+    coupon: session.draft.couponCode ?? "none",
+    loyalty: session.draft.loyalty
+      ? `${session.draft.loyalty.tier}, ${session.draft.loyalty.points} points`
+      : "not verified",
+    missingFields: missingFields.length > 0 ? formatMissingFields(missingFields, session.locale) : "none",
+    nextAction: getHandoffNextAction(session, missingFields)
+  };
+}
+
+function getHandoffNextAction(session: ConversationSession, missingFields: string[]): string {
+  if (session.draft.items.length === 0) {
+    return session.locale === "vi" ? "Hỏi khách muốn đặt món nào." : "Ask what the customer wants to order.";
+  }
+
+  if (missingFields.length > 0) {
+    return session.locale === "vi"
+      ? `Thu thập thêm ${formatMissingFields(missingFields, session.locale)}.`
+      : `Collect ${formatMissingFields(missingFields, session.locale)}.`;
+  }
+
+  return session.locale === "vi"
+    ? "Xác nhận lại đơn và hỗ trợ tạo đơn."
+    : "Review the order and help create it.";
+}
+
+function formatLlmDraftSummary(session: ConversationSession): string {
+  if (session.draft.items.length === 0) {
+    return "empty";
+  }
+
+  const lines = session.draft.items.map((draftItem) => {
+    const item = getMenuItem(draftItem.sku);
+    return item ? `${draftItem.quantity} x ${item.name} [${item.orderId}]` : `${draftItem.quantity} x ${draftItem.sku}`;
+  });
+
+  return [
+    ...lines,
+    session.draft.couponCode ? `coupon: ${session.draft.couponCode}` : undefined,
+    session.draft.paymentMethod ? `payment: ${formatPaymentMethod(session.draft.paymentMethod)}` : undefined,
+    session.draft.customer.phone ? `phone: ${session.draft.customer.phone}` : undefined,
+    session.draft.customer.address ? `address: ${session.draft.customer.address}` : undefined,
+    session.draft.loyalty
+      ? `loyalty: ${session.draft.loyalty.tier}, ${session.draft.loyalty.points} points`
+      : undefined,
+    session.draft.notes ? `notes: ${session.draft.notes}` : undefined
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function formatLlmMenuContext(normalizedText: string): string {
+  const directMatches = searchMenuItems(normalizedText, 12);
+  const fallbackItems = directMatches.length > 0 ? directMatches : [...listHotCombos(6), ...listCheapestItems(6)];
+  const uniqueItems = [...new Map(fallbackItems.map((item) => [item.sku, item])).values()].slice(0, 12);
+
+  return uniqueItems
+    .map((item) => {
+      const stockText = item.isAvailable && item.stockQuantity > 0 ? `${item.stockQuantity} left` : "unavailable";
+      return `[${item.orderId}] ${item.name} | ${formatVnd(item.price)} | ${item.categoryName} | ${stockText}`;
+    })
+    .join("\n");
+}
+
+function detectLocale(text: string, normalizedText: string, currentLocale: ConversationSession["locale"]): ConversationSession["locale"] {
+  if (/[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]/i.test(text)) {
+    return "vi";
+  }
+
+  if (currentLocale === "vi" && isGreeting(normalizedText)) {
+    return "vi";
+  }
+
+  const vietnameseSignals = [
+    "cho minh",
+    "cho em",
+    "cho anh",
+    "cho chi",
+    "em muon",
+    "anh muon",
+    "chi muon",
+    "ban oi",
+    "alo",
+    "toi muon",
+    "minh muon",
+    "dat mon",
+    "goi mon",
+    "them mon",
+    "xem gio",
+    "gio hang",
+    "don hang",
+    "xac nhan",
+    "chot don",
+    "khong co",
+    "dia chi",
+    "sdt",
+    "so dien thoai",
+    "thanh toan",
+    "ghi chu",
+    "huy don",
+    "bo don",
+    "doi",
+    "sua"
+  ];
+
+  if (vietnameseSignals.some((signal) => normalizedText.includes(signal)) || hasVietnamesePronoun(normalizedText)) {
+    return "vi";
+  }
+
+  const englishSignals = ["add", "remove", "change", "replace", "confirm", "delivery address", "phone", "no coupon"];
+
+  if (englishSignals.some((signal) => normalizedText.includes(signal))) {
+    return "en";
+  }
+
+  return currentLocale;
+}
+
+function hasVietnamesePronoun(normalizedText: string): boolean {
+  return /\b(?:em|anh|chi|minh|toi|ban)\b/.test(normalizedText);
+}
+
+function getLanguageSwitchLocale(normalizedText: string): ConversationSession["locale"] | undefined {
+  if (["tieng viet", "viet nam", "vietnamese", "vi", "vietnamese language"].includes(normalizedText)) {
+    return "vi";
+  }
+
+  if (["english", "tieng anh", "en", "english language"].includes(normalizedText)) {
+    return "en";
+  }
+
+  return undefined;
+}
+
+function getBudgetRecommendationResponse(normalizedText: string, locale: ConversationSession["locale"]): string | undefined {
+  const budget = extractBudgetVnd(normalizedText);
+  const diners = extractDiners(normalizedText);
+
+  if (!budget && !diners) {
+    return undefined;
+  }
+
+  const availableItems = listMenuItems().filter((item) => item.isAvailable && item.stockQuantity > 0);
+  const candidates = availableItems
+    .filter((item) => {
+      const groupFit = diners && diners >= 2 ? item.categoryIds.includes("combo-nhom") || normalizeSearchText(item.name).includes("combo") : true;
+      const budgetFit = budget ? item.price <= budget : true;
+      return groupFit && budgetFit;
+    })
+    .sort((left, right) => {
+      const leftDistance = budget ? Math.abs(budget - left.price) : 0;
+      const rightDistance = budget ? Math.abs(budget - right.price) : 0;
+      return leftDistance - rightDistance || right.price - left.price;
+    })
+    .slice(0, 5);
+
+  if (candidates.length === 0) {
+    return locale === "vi"
+      ? "Mình chưa thấy combo nào khớp ngân sách đó. Bạn muốn mình gợi ý món giá thấp hơn không?"
+      : "I could not find a combo that fits that budget. Would you like lower-priced options?";
+  }
+
+  return [
+    locale === "vi"
+      ? `Mình lọc vài lựa chọn${diners ? ` cho ${diners} người` : ""}${budget ? ` trong tầm ${formatVnd(budget)}` : ""}:`
+      : `Here are options${diners ? ` for ${diners} people` : ""}${budget ? ` around ${formatVnd(budget)}` : ""}:`,
+    ...candidates.map(formatMenuLine),
+    locale === "vi"
+      ? "Bạn chọn mã món và số lượng, mình sẽ thêm vào giỏ."
+      : "Send the item ID and quantity to add one to your cart."
+  ].join("\n");
+}
+
+function isLanguageHelpIntent(normalizedText: string): boolean {
+  return ["language", "lang", "ngon ngu", "doi ngon ngu", "chuyen ngon ngu"].includes(normalizedText);
+}
+
+function formatLanguageSwitchConfirmation(locale: ConversationSession["locale"]): string {
+  return locale === "vi"
+    ? "Mình đã chuyển sang tiếng Việt. Bạn có thể dùng /en để đổi sang English, hoặc gõ /menu để xem thực đơn."
+    : "I switched to English. Use /vi to switch to Vietnamese, or send /menu to view the menu.";
+}
+
+function formatLanguageHelp(locale: ConversationSession["locale"]): string {
+  return locale === "vi"
+    ? [
+        "Bạn có thể đổi ngôn ngữ bằng slash command:",
+        "/vi - Tiếng Việt",
+        "/en - English"
+      ].join("\n")
+    : [
+        "You can switch language with slash commands:",
+        "/vi - Vietnamese",
+        "/en - English"
+      ].join("\n");
+}
+
+function formatEmptyCart(locale: ConversationSession["locale"]): string {
+  return locale === "vi" ? "Giỏ hàng của bạn đang trống." : "Your cart is empty.";
+}
+
+function formatAddedLine(item: MenuItem, quantity: number, locale: ConversationSession["locale"]): string {
+  return locale === "vi" ? `Mình đã thêm ${quantity} x ${item.name} vào giỏ.` : `Added ${quantity} x ${item.name}.`;
+}
+
+function formatRemovedLine(item: MenuItem, quantity: number | undefined, locale: ConversationSession["locale"]): string {
+  if (quantity !== undefined) {
+    return locale === "vi" ? `Mình đã bỏ ${quantity} x ${item.name}.` : `Removed ${quantity} x ${item.name}.`;
+  }
+
+  return locale === "vi" ? `Mình đã bỏ ${item.name} khỏi giỏ.` : `Removed ${item.name}.`;
+}
+
+function formatChangedItemLine(oldItem: MenuItem, newItem: MenuItem, locale: ConversationSession["locale"]): string {
+  return locale === "vi" ? `Mình đã đổi ${oldItem.name} thành ${newItem.name}.` : `Changed ${oldItem.name} to ${newItem.name}.`;
+}
+
+function formatChangedQuantityLine(item: MenuItem, quantity: number, locale: ConversationSession["locale"]): string {
+  return locale === "vi" ? `Mình đã đổi số lượng ${item.name} thành ${quantity}.` : `Changed the quantity of ${item.name} to ${quantity}.`;
+}
+
+function formatMissingFields(missingFields: string[], locale: ConversationSession["locale"]): string {
+  if (locale !== "vi") {
+    return missingFields.join(", ");
+  }
+
+  return missingFields.map(formatMissingField).join(", ");
+}
+
+function formatMissingField(field: string): string {
+  const translations = new Map([
+    ["a valid phone number", "số điện thoại hợp lệ"],
+    ["a delivery address", "địa chỉ giao hàng"],
+    ["a payment method (COD/VNPay)", "hình thức thanh toán (COD/VNPay)"]
+  ]);
+
+  return translations.get(field) ?? field;
+}
+
+function formatCouponReason(reason: string | undefined, locale: ConversationSession["locale"]): string | undefined {
+  if (!reason || locale !== "vi") {
+    return reason;
+  }
+
+  return formatErrorMessage(reason, locale);
+}
+
+function formatErrorMessage(message: string, locale: ConversationSession["locale"]): string {
+  if (locale !== "vi") {
+    return message;
+  }
+
+  if (message === "Coupon code does not exist.") {
+    return "mã giảm giá không tồn tại.";
+  }
+
+  if (message === "Coupon has already been used.") {
+    return "mã giảm giá này đã được sử dụng.";
+  }
+
+  if (message === "Coupon is inactive.") {
+    return "mã giảm giá hiện không hoạt động.";
+  }
+
+  if (message === "Coupon has expired.") {
+    return "mã giảm giá đã hết hạn.";
+  }
+
+  if (message.startsWith("Minimum subtotal is ")) {
+    return message.replace("Minimum subtotal is ", "giá trị món tối thiểu là ");
+  }
+
+  if (message.startsWith("Coupon requires payment method: ")) {
+    return message.replace("Coupon requires payment method: ", "mã này chỉ áp dụng cho phương thức thanh toán: ");
+  }
+
+  if (message.endsWith("is currently unavailable.")) {
+    return message.replace(" is currently unavailable.", " hiện không khả dụng.");
+  }
+
+  if (message.includes("only has") && message.includes("item(s) left")) {
+    return message.replace(" only has ", " chỉ còn ").replace(" item(s) left.", " phần.");
+  }
+
+  return message;
 }
 
 function getOrCreateSession(chatId: string, displayName: string): ConversationSession {
@@ -982,6 +1738,7 @@ function getOrCreateSession(chatId: string, displayName: string): ConversationSe
 
   const session: ConversationSession = {
     chatId,
+    locale: "en",
     status: "IDLE",
     draft: {
       items: [],
@@ -1005,6 +1762,7 @@ function resetDraft(session: ConversationSession) {
   session.draft.couponHandled = false;
   session.draft.paymentMethod = undefined;
   session.draft.notes = undefined;
+  session.draft.loyalty = undefined;
   session.pendingQuestion = undefined;
 }
 
@@ -1024,9 +1782,14 @@ function formatPaymentMethod(paymentMethod: PaymentMethod): string {
   return paymentMethod === "vnpay" ? "VNPay" : "COD";
 }
 
-function formatPaymentQuestion(): string {
-  return [
-    "Which payment method would you prefer?",
-    "Reply \"COD\" to pay on delivery or \"VNPay\" to pay online."
-  ].join("\n");
+function formatPaymentQuestion(locale: ConversationSession["locale"] = "en"): string {
+  return locale === "vi"
+    ? [
+        "Bạn muốn thanh toán bằng hình thức nào?",
+        "Nhắn \"COD\" để trả tiền khi nhận hàng, hoặc \"VNPay\" để thanh toán online."
+      ].join("\n")
+    : [
+        "Which payment method would you prefer?",
+        "Reply \"COD\" to pay on delivery or \"VNPay\" to pay online."
+      ].join("\n");
 }

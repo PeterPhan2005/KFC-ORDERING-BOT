@@ -2,10 +2,12 @@ import { createApp } from "./app.js";
 import { config } from "./config.js";
 import { initializeDatabase } from "./lib/database.js";
 import { initializeCouponRedemptions } from "./services/coupon-redemptions.js";
+import { configureTelegramBotCommands } from "./services/telegram.js";
 
 async function start() {
   await initializeDatabase();
   await initializeCouponRedemptions();
+  await configureTelegramBotCommands();
   const app = createApp();
 
   app.listen(config.port, () => {
