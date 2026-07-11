@@ -1,9 +1,10 @@
 import { couponsByCode } from "../data/coupons.js";
-import { menuBySku } from "../data/menu.js";
 import { AppError } from "../lib/app-error.js";
 import type { Coupon, CouponResult, OrderQuote, QuoteInput } from "../types.js";
+import { getMenuItem } from "./menu.js";
+import { isCouponRedeemed } from "./coupon-redemptions.js";
 
-const DELIVERY_FEE = 18000;
+const DELIVERY_FEE = 20000;
 
 export function createQuote(input: QuoteInput, now = new Date()): OrderQuote {
   if (input.items.length === 0) {
@@ -11,7 +12,7 @@ export function createQuote(input: QuoteInput, now = new Date()): OrderQuote {
   }
 
   const lines = input.items.map((inputItem) => {
-    const menuItem = menuBySku.get(inputItem.sku);
+    const menuItem = getMenuItem(inputItem.sku);
 
     if (!menuItem) {
       throw new AppError(400, `Unknown menu SKU: ${inputItem.sku}`);
@@ -19,6 +20,10 @@ export function createQuote(input: QuoteInput, now = new Date()): OrderQuote {
 
     if (!menuItem.isAvailable) {
       throw new AppError(409, `${menuItem.name} is currently unavailable.`);
+    }
+
+    if (menuItem.stockQuantity < inputItem.quantity) {
+      throw new AppError(409, `${menuItem.name} only has ${menuItem.stockQuantity} item(s) left.`);
     }
 
     const lineTotal = menuItem.price * inputItem.quantity;
@@ -114,6 +119,10 @@ function getCouponInvalidReason(
 ) {
   if (!coupon.isActive) {
     return "Coupon is inactive.";
+  }
+
+  if (isCouponRedeemed(coupon.code)) {
+    return "Coupon has already been used.";
   }
 
   if (new Date(coupon.expiresAt) < now) {

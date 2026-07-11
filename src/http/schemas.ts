@@ -27,3 +27,14 @@ export const createOrderRequestSchema = z.object({
 export const updateOrderStatusRequestSchema = z.object({
   status: z.enum(["CONFIRMED_COD", "PENDING_PAYMENT", "PAID", "CANCELLED"])
 });
+
+export const updateMenuItemRequestSchema = z.object({
+  price: z.number().int().min(0).max(10000000).optional(),
+  stockQuantity: z.number().int().min(0).max(100000).optional(),
+  isAvailable: z.boolean().optional()
+});
+
+export const updateStoreHoursRequestSchema = z.object({
+  openHour: z.coerce.number().int().min(0).max(23),
+  closeHour: z.coerce.number().int().min(0).max(23)
+});

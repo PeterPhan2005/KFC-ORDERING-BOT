@@ -1,15 +1,29 @@
-export type MenuCategory = "chicken" | "burger" | "combo" | "side" | "drink";
+export type MenuCategory = {
+  id: string;
+  name: string;
+  slug: string;
+  displayOrder: number;
+};
 
 export type PaymentMethod = "cod" | "vnpay";
 
 export type OrderStatus = "CONFIRMED_COD" | "PENDING_PAYMENT" | "PAID" | "CANCELLED";
 
 export type MenuItem = {
+  orderId: string;
   sku: string;
+  catalogId: string;
+  slug: string;
   name: string;
-  category: MenuCategory;
+  category: string;
+  categoryName: string;
+  categoryIds: string[];
   description: string;
   price: number;
+  originalPrice: number | null;
+  imageUrl: string;
+  productUrl: string;
+  stockQuantity: number;
   aliases: string[];
   isAvailable: boolean;
 };
@@ -81,4 +95,9 @@ export type Order = {
   quote: OrderQuote;
   createdAt: string;
   updatedAt: string;
+};
+
+export type OrderStatusTransition = {
+  from: OrderStatus;
+  to: OrderStatus;
 };
