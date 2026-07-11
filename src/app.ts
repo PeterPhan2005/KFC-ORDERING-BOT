@@ -21,6 +21,7 @@ import {
   updateAdminOrderStatus,
   updateAdminStoreHours
 } from "./http/admin.js";
+import { renderPublicDashboard } from "./http/public-dashboard.js";
 import {
   quoteRequestSchema,
   createOrderRequestSchema,
@@ -59,11 +60,28 @@ export function createApp() {
     });
   });
 
-  app.get("/", (_request, response) => {
+  app.get("/", async (_request, response, next) => {
+    try {
+      response.type("html").send(await renderPublicDashboard());
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/dashboard", async (_request, response, next) => {
+    try {
+      response.type("html").send(await renderPublicDashboard());
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api", (_request, response) => {
     response.json({
       ok: true,
       service: "kfc-tracks",
       endpoints: {
+        dashboard: "/dashboard",
         health: "/health",
         admin: "/admin",
         telegramWebhook: "/webhooks/telegram",

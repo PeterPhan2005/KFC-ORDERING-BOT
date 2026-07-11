@@ -438,10 +438,28 @@ describe("orders API", () => {
       .expect(401);
   });
 
-  it("lists available local endpoints at the root route", async () => {
+  it("renders the public dashboard at the root route", async () => {
     const response = await request(app).get("/").expect(200);
 
+    expect(response.headers["content-type"]).toContain("text/html");
+    expect(response.text).toContain("KFC Tracks Dashboard");
+    expect(response.text).toContain("Food ordering dashboard for VNPay review");
+    expect(response.text).toContain("/payments/vnpay/ipn");
+    expect(response.text).toContain("Featured Menu");
+  });
+
+  it("renders the public dashboard at /dashboard", async () => {
+    const response = await request(app).get("/dashboard").expect(200);
+
+    expect(response.text).toContain("KFC Tracks Dashboard");
+    expect(response.text).toContain("VNPAY25");
+  });
+
+  it("lists available local endpoints at the API route", async () => {
+    const response = await request(app).get("/api").expect(200);
+
     expect(response.body.endpoints).toMatchObject({
+      dashboard: "/dashboard",
       health: "/health",
       admin: "/admin",
       telegramWebhook: "/webhooks/telegram",
