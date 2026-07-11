@@ -16,7 +16,7 @@ import {
   suggestMenuItemsForText,
   suggestAlternatives
 } from "./menu.js";
-import { createOrder } from "./orders.js";
+import { createOrder, getOrder } from "./orders.js";
 import { createQuote } from "./pricing.js";
 import { getStoreHours } from "./store.js";
 import { interpretChatMessageWithLlm, isLlmConfigured } from "./llm.js";
@@ -107,6 +107,12 @@ export async function processChatMessage(input: ChatMessageInput, options: ChatP
     return reply(formatLanguageHelp(session.locale));
   }
 
+  const vnpayStartPayload = extractVnpayStartPayload(text);
+
+  if (vnpayStartPayload) {
+    return handleVnpayStartPayload(session, vnpayStartPayload);
+  }
+
   const contactUpdate = extractContactInfo(text, session);
 
   if (contactUpdate.phone) {
@@ -179,9 +185,15 @@ export async function processChatMessage(input: ChatMessageInput, options: ChatP
   const couponCode = extractCouponCode(text);
 
   if (couponCode) {
+    const wasAwaitingCoupon = session.pendingQuestion === "coupon";
     session.draft.couponCode = couponCode;
     session.draft.couponHandled = true;
     session.pendingQuestion = undefined;
+
+    if (wasAwaitingCoupon) {
+      return handleConfirmOrder(session, input.now ?? new Date());
+    }
+
     return reply(formatDraftResponse(session));
   }
 
@@ -192,16 +204,28 @@ export async function processChatMessage(input: ChatMessageInput, options: ChatP
   const paymentMethod = extractPaymentMethod(normalizedText);
 
   if (paymentMethod) {
+    const wasAwaitingPayment = session.pendingQuestion === "payment";
     session.draft.paymentMethod = paymentMethod;
     session.pendingQuestion = undefined;
+
+    if (wasAwaitingPayment) {
+      return handleConfirmOrder(session, input.now ?? new Date());
+    }
+
     return reply(formatDraftResponse(session));
   }
 
   if (isSkipCouponIntent(normalizedText) || (session.pendingQuestion === "coupon" && isBareNegativeIntent(normalizedText))) {
+    const wasAwaitingCoupon = session.pendingQuestion === "coupon";
     session.draft.couponCode = undefined;
     session.draft.couponHandled = true;
-    session.pendingQuestion = "payment";
-    return reply(formatPaymentQuestion(session.locale));
+    session.pendingQuestion = undefined;
+
+    if (wasAwaitingCoupon) {
+      return handleConfirmOrder(session, input.now ?? new Date());
+    }
+
+    return reply(formatDraftResponse(session));
   }
 
   const notes = extractOrderNotes(text);
@@ -696,6 +720,37 @@ async function handleConfirmOrder(session: ConversationSession, now: Date): Prom
   }
 }
 
+async function handleVnpayStartPayload(
+  session: ConversationSession,
+  payload: { status: "paid" | "failed"; orderId: string }
+): Promise<ChatMessageResult> {
+  const order = await getOrder(payload.orderId);
+
+  if (payload.status === "paid" && order?.status === "PAID") {
+    resetDraft(session);
+
+    return reply(
+      session.locale === "vi"
+        ? `Thanh toán VNPay cho đơn ${order.id} đã thành công. Giỏ hàng hiện tại của bạn đang trống.`
+        : `VNPay payment for order ${order.id} was successful. Your cart is now empty.`
+    );
+  }
+
+  if (payload.status === "failed") {
+    return reply(
+      session.locale === "vi"
+        ? `Thanh toán VNPay cho đơn ${payload.orderId} chưa hoàn tất. Bạn có thể mở lại link thanh toán hoặc liên hệ hỗ trợ.`
+        : `VNPay payment for order ${payload.orderId} was not completed. You can reopen the payment link or contact support.`
+    );
+  }
+
+  return reply(
+    session.locale === "vi"
+      ? `Mình chưa xác minh được thanh toán VNPay cho đơn ${payload.orderId}.`
+      : `I could not verify the VNPay payment for order ${payload.orderId}.`
+  );
+}
+
 function formatDraftResponse(session: ConversationSession): string {
   if (session.draft.items.length === 0) {
     return formatEmptyCart(session.locale);
@@ -1136,6 +1191,19 @@ function getMissingCheckoutFields(draft: DraftOrder): string[] {
 
 function isGreeting(normalizedText: string): boolean {
   return normalizedText === "start" || /^(?:xin chao|chao|hello|hi)(?:\s|$)/.test(normalizedText);
+}
+
+function extractVnpayStartPayload(text: string): { status: "paid" | "failed"; orderId: string } | undefined {
+  const match = text.trim().match(/^\/start\s+vnpay_(paid|failed)_([A-Za-z0-9-]+)$/i);
+
+  if (!match) {
+    return undefined;
+  }
+
+  return {
+    status: match[1].toLowerCase() as "paid" | "failed",
+    orderId: match[2]
+  };
 }
 
 function isMenuIntent(normalizedText: string): boolean {

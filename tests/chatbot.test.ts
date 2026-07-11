@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { processChatMessage, clearConversationSessionsForTest } from "../src/services/chatbot.js";
 import { getMenuItem, resetMenuForTest, updateMenuItem } from "../src/services/menu.js";
-import { clearOrdersForTest, listOrders } from "../src/services/orders.js";
+import { clearOrdersForTest, listOrders, updateOrderStatus } from "../src/services/orders.js";
 
 const OPEN_TIME = new Date("2026-07-11T05:00:00.000Z");
 const CLOSED_TIME = new Date("2026-07-11T16:00:00.000Z");
@@ -18,9 +18,7 @@ describe("Telegram chatbot ordering", () => {
     await send("sdt 0900000000, địa chỉ 123 Nguyễn Trãi Quận 1");
     await send("COD");
     expect((await send("xác nhận")).reply).toContain("Bạn có mã giảm giá không?");
-    await send("không có coupon");
-    await send("COD");
-    const result = await send("xác nhận");
+    const result = await send("không có coupon");
 
     expect(result.createdOrderIds).toHaveLength(1);
     expect(result.reply).toContain("Mình đã xác nhận đơn của bạn");
@@ -34,8 +32,7 @@ describe("Telegram chatbot ordering", () => {
     await send("add 1 Zinger Burger Combo");
     await send("0900000000, 123 Nguyen Trai Street, District 1, COD");
     expect((await send("confirm")).reply).toContain("Do you have a coupon code?");
-    await send("no");
-    const result = await send("confirm");
+    const result = await send("no");
 
     expect(result.reply).toContain("Your order has been confirmed.");
     expect((await listOrders())[0]).toMatchObject({ paymentMethod: "cod", status: "CONFIRMED_COD" });
@@ -365,7 +362,8 @@ describe("Telegram chatbot ordering", () => {
 
     const result = await send("ko có");
 
-    expect(result.reply).toContain("Bạn muốn thanh toán bằng hình thức nào?");
+    expect(result.createdOrderIds).toHaveLength(1);
+    expect(result.reply).toContain("Mình đã xác nhận đơn của bạn");
   });
 
   it("requires payment selection and includes contact details in the final confirmation", async () => {
@@ -373,12 +371,39 @@ describe("Telegram chatbot ordering", () => {
     await send("0900000000 địa chỉ 123 Nguyễn Trãi Quận 1");
     await send("coupon KFC20");
     expect((await send("xác nhận")).reply).toContain("hình thức thanh toán (COD/VNPay)");
-    await send("COD");
-    const result = await send("xác nhận");
+    const result = await send("COD");
 
     expect(result.reply).toContain("Thanh toán: COD");
     expect(result.reply).toContain("Số điện thoại: 0900000000");
     expect(result.reply).toContain("Địa chỉ giao hàng: 123 Nguyễn Trãi Quận 1");
+  });
+
+  it("does not ask again for payment or confirmation after a coupon response when checkout is complete", async () => {
+    await send("cho mình 1 combo burger zinger");
+    await send("0900000000, địa chỉ 123 Nguyễn Trãi Quận 1, COD");
+    expect((await send("xác nhận")).reply).toContain("Bạn có mã giảm giá không?");
+
+    const result = await send("không");
+
+    expect(result.createdOrderIds).toHaveLength(1);
+    expect(result.reply).toContain("Mình đã xác nhận đơn của bạn");
+    expect(result.reply).not.toContain("Bạn muốn thanh toán bằng hình thức nào?");
+  });
+
+  it("reports successful VNPay payment from the Telegram start payload and clears the cart", async () => {
+    await send("cho mình 1 combo burger zinger");
+    await send("0900000000, địa chỉ 123 Nguyễn Trãi Quận 1, VNPay");
+    await send("xác nhận");
+    const confirmation = await send("không");
+    const orderId = confirmation.createdOrderIds[0];
+
+    await updateOrderStatus(orderId, "PAID");
+    const result = await send(`/start vnpay_paid_${orderId}`);
+
+    expect(result.reply).toContain("Thanh toán VNPay");
+    expect(result.reply).toContain("đã thành công");
+    expect(result.reply).toContain("Giỏ hàng hiện tại của bạn đang trống");
+    expect((await send("xem giỏ hàng")).reply).toContain("trống");
   });
 
   it("collects phone, address, and payment from one checkout message", async () => {
