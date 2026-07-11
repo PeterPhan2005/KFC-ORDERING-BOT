@@ -524,11 +524,11 @@ export async function renderAdminDashboard(pageInput: unknown): Promise<string> 
         </label>
         <label class="field">
           Closes at
-          <input name="closeHour" type="number" min="0" max="23" step="1" value="${storeHours.closeHour}" required>
+          <input name="closeHour" type="number" min="0" max="24" step="1" value="${storeHours.closeHour}" required>
         </label>
         <button type="submit">Save hours</button>
       </form>
-      <p class="muted">Current hours: ${formatHour(storeHours.openHour)}–${formatHour(storeHours.closeHour)}. Changes are kept until the server restarts.</p>
+      <p class="muted">Current hours: ${formatHour(storeHours.openHour)}–${formatHour(storeHours.closeHour)}. Changes are saved for reloads and restarts.</p>
     </section>
     <section class="panel" aria-labelledby="menu-title">
       <div class="panel-header">
@@ -660,12 +660,12 @@ export function updateAdminMenuItem(request: Request, response: Response) {
   response.redirect(303, "/admin");
 }
 
-export function updateAdminStoreHours(
+export async function updateAdminStoreHours(
   request: Request,
   response: Response,
   input: { openHour: number; closeHour: number }
 ) {
-  updateStoreHours(input);
+  await updateStoreHours(input);
   response.redirect(303, getAdminRedirectPath(request));
 }
 

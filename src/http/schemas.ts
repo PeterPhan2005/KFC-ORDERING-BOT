@@ -36,5 +36,5 @@ export const updateMenuItemRequestSchema = z.object({
 
 export const updateStoreHoursRequestSchema = z.object({
   openHour: z.coerce.number().int().min(0).max(23),
-  closeHour: z.coerce.number().int().min(0).max(23)
+  closeHour: z.coerce.number().int().min(0).max(24)
 });

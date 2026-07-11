@@ -307,11 +307,15 @@ describe("orders API", () => {
 
     await agent
       .post("/admin/store-hours")
-      .send({ openHour: 8, closeHour: 22 })
+      .send({ openHour: 8, closeHour: 24 })
       .expect(303);
 
     const response = await agent.get("/admin").expect(200);
-    expect(response.text).toContain("Current hours: 08:00–22:00");
+    expect(response.text).toContain("Current hours: 08:00–24:00");
+    expect(response.text).toContain('name="closeHour" type="number" min="0" max="24"');
+
+    const refreshResponse = await agent.get("/admin").expect(200);
+    expect(refreshResponse.text).toContain("Current hours: 08:00–24:00");
   });
 
   it("paginates orders in the admin dashboard", async () => {

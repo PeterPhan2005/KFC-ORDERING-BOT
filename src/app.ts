@@ -183,10 +183,10 @@ export function createApp() {
     }
   });
 
-  app.post("/admin/store-hours", requireAdmin, (request, response, next) => {
+  app.post("/admin/store-hours", requireAdmin, async (request, response, next) => {
     try {
       const input = updateStoreHoursRequestSchema.parse(request.body);
-      updateAdminStoreHours(request, response, input);
+      await updateAdminStoreHours(request, response, input);
     } catch (error) {
       next(error);
     }
