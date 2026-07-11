@@ -18,6 +18,7 @@ describe("VNPay sandbox integration", () => {
     config.vnpay.paymentUrl = "https://sandbox.vnpayment.vn/paymentv2/vpcpay.html";
     config.vnpay.returnUrl = "https://example.com/payments/vnpay/return";
     config.vnpay.ipnUrl = "https://example.com/payments/vnpay/ipn";
+    config.telegram.botUrl = "https://t.me/Cfc_Kfc_ordering_bot";
   });
 
   it("creates a signed payment URL with the order total", async () => {
@@ -77,6 +78,54 @@ describe("VNPay sandbox integration", () => {
     expect(response.body.RspCode).toBe("04");
     const ordersResponse = await request(app).get("/orders").expect(200);
     expect(ordersResponse.body.orders[0].status).toBe("PENDING_PAYMENT");
+  });
+
+  it("redirects a valid successful VNPay return back to the Telegram bot", async () => {
+    const order = await createVnpayOrder();
+    const params = {
+      vnp_Amount: String(order.quote.total * 100),
+      vnp_ResponseCode: "00",
+      vnp_TransactionStatus: "00",
+      vnp_TxnRef: order.id
+    };
+
+    const response = await request(app)
+      .get("/payments/vnpay/return")
+      .query({ ...params, vnp_SecureHash: createVnpaySecureHash(params) })
+      .expect(303);
+
+    expect(response.header.location).toBe(`https://t.me/Cfc_Kfc_ordering_bot?start=vnpay_paid_${order.id}`);
+    const ordersResponse = await request(app).get("/orders").expect(200);
+    expect(ordersResponse.body.orders[0].status).toBe("PAID");
+  });
+
+  it("redirects a valid failed VNPay return back to the Telegram bot without marking paid", async () => {
+    const order = await createVnpayOrder();
+    const params = {
+      vnp_Amount: String(order.quote.total * 100),
+      vnp_ResponseCode: "24",
+      vnp_TransactionStatus: "02",
+      vnp_TxnRef: order.id
+    };
+
+    const response = await request(app)
+      .get("/payments/vnpay/return")
+      .query({ ...params, vnp_SecureHash: createVnpaySecureHash(params) })
+      .expect(303);
+
+    expect(response.header.location).toBe(`https://t.me/Cfc_Kfc_ordering_bot?start=vnpay_failed_${order.id}`);
+    const ordersResponse = await request(app).get("/orders").expect(200);
+    expect(ordersResponse.body.orders[0].status).toBe("PENDING_PAYMENT");
+  });
+
+  it("shows an error page for an invalid VNPay return signature", async () => {
+    const response = await request(app)
+      .get("/payments/vnpay/return")
+      .query({ vnp_TxnRef: "fake", vnp_SecureHash: "invalid" })
+      .expect(400);
+
+    expect(response.text).toContain("Payment result could not be verified");
+    expect(response.text).toContain("https://t.me/Cfc_Kfc_ordering_bot");
   });
 
   it("handles duplicate successful IPN callbacks idempotently", async () => {

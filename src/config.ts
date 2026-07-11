@@ -24,7 +24,8 @@ export const config = {
   },
   telegram: {
     botToken: process.env.TELEGRAM_BOT_TOKEN ?? "",
-    webhookSecret: process.env.TELEGRAM_WEBHOOK_SECRET ?? ""
+    webhookSecret: process.env.TELEGRAM_WEBHOOK_SECRET ?? "",
+    botUrl: process.env.TELEGRAM_BOT_URL ?? "https://t.me/Cfc_Kfc_ordering_bot"
   },
   vnpay: {
     tmnCode: process.env.VNPAY_TMN_CODE ?? "",

@@ -5,6 +5,7 @@ import morgan from "morgan";
 import { join } from "node:path";
 import { cwd } from "node:process";
 import { ZodError } from "zod";
+import { config } from "./config.js";
 import { coupons } from "./data/coupons.js";
 import { menuCategories } from "./data/menu.js";
 import {
@@ -248,11 +249,19 @@ export function createApp() {
       const order = result.orderId ? await getOrder(result.orderId) : undefined;
       const amountMatches = order && String(order.quote.total * 100) === String(request.query.vnp_Amount ?? "");
 
-      response.status(result.isValid && amountMatches ? 200 : 400).json({
-        ok: Boolean(result.isValid && amountMatches),
-        paid: Boolean(result.isValid && amountMatches && result.isSuccessfulPayment),
-        orderId: result.orderId
-      });
+      if (!result.isValid || !order || !amountMatches) {
+        response.status(400).type("html").send(renderVnpayReturnError());
+        return;
+      }
+
+      if (result.isSuccessfulPayment && order.status !== "PAID") {
+        await updateOrderStatus(order.id, "PAID");
+      }
+
+      response.redirect(
+        303,
+        createTelegramPaymentReturnUrl(order.id, result.isSuccessfulPayment ? "paid" : "failed")
+      );
     } catch (error) {
       next(error);
     }
@@ -337,6 +346,91 @@ export function createApp() {
   app.use(errorHandler);
 
   return app;
+}
+
+function createTelegramPaymentReturnUrl(orderId: string, status: "paid" | "failed"): string {
+  const url = new URL(config.telegram.botUrl || "https://t.me/Cfc_Kfc_ordering_bot");
+  url.searchParams.set("start", createTelegramStartPayload(`vnpay_${status}_${orderId}`));
+
+  return url.toString();
+}
+
+function createTelegramStartPayload(value: string): string {
+  return value.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 64);
+}
+
+function renderVnpayReturnError(): string {
+  const botUrl = escapeHtml(config.telegram.botUrl || "https://t.me/Cfc_Kfc_ordering_bot");
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VNPay Return</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f7f6f1;
+      color: #171717;
+    }
+    body {
+      min-height: 100vh;
+      margin: 0;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      background: #f7f6f1;
+    }
+    main {
+      width: min(100%, 440px);
+      background: #fff;
+      border: 1px solid #dfddd4;
+      border-radius: 8px;
+      padding: 22px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 22px;
+      letter-spacing: 0;
+    }
+    p {
+      margin: 10px 0 0;
+      color: #66635d;
+      line-height: 1.5;
+    }
+    a {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 40px;
+      margin-top: 16px;
+      padding: 0 14px;
+      border-radius: 6px;
+      background: #171717;
+      color: #fff;
+      text-decoration: none;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Payment result could not be verified</h1>
+    <p>Please return to KFC BOT so the order can be checked by support.</p>
+    <a href="${botUrl}">Open KFC BOT</a>
+  </main>
+</body>
+</html>`;
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
 
 const errorHandler: ErrorRequestHandler = (error, _request, response, _next) => {

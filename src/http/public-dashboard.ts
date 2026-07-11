@@ -449,6 +449,10 @@ export async function renderPublicDashboard(): Promise<string> {
                 <td><span class="code">${escapeHtml(config.vnpay.returnUrl)}</span></td>
               </tr>
               <tr>
+                <td>After payment</td>
+                <td><span class="code">${escapeHtml(config.telegram.botUrl)}</span></td>
+              </tr>
+              <tr>
                 <td>VNPay IPN</td>
                 <td><span class="code">${escapeHtml(config.vnpay.ipnUrl)}</span></td>
               </tr>
